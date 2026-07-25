@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #070b14;
+  --panel: #0f1626;
+  --panel-2: #131c30;
+  --border: #1e2942;
+  --accent: #22d3ee;
+  --accent-2: #34d399;
+  --text: #e5eaf3;
+  --glass-bg-1: rgba(255, 255, 255, 0.05);
+  --glass-bg-2: rgba(255, 255, 255, 0.02);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glow-1: rgba(34, 211, 238, 0.08);
+  --glow-2: rgba(52, 211, 153, 0.06);
+}
+
+:root.light {
+  --bg: #eef2f8;
+  --panel: #ffffff;
+  --panel-2: #f4f7fb;
+  --border: #dce3ee;
+  --text: #0f172a;
+  --glass-bg-1: rgba(255, 255, 255, 0.85);
+  --glass-bg-2: rgba(255, 255, 255, 0.65);
+  --glass-border: rgba(15, 23, 42, 0.08);
+  --glow-1: rgba(34, 211, 238, 0.15);
+  --glow-2: rgba(52, 211, 153, 0.12);
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+body {
+  background-image:
+    radial-gradient(1200px 600px at 15% -10%, var(--glow-1), transparent 60%),
+    radial-gradient(1000px 500px at 100% 0%, var(--glow-2), transparent 55%);
+  background-attachment: fixed;
+}
+
+/* 玻璃擬態卡片 */
+.glass {
+  background: linear-gradient(160deg, var(--glass-bg-1), var(--glass-bg-2));
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(12px);
+}
+
+:root.light .text-white {
+  color: #0f172a;
+}
+:root.light .text-slate-300,
+:root.light .text-slate-400 {
+  color: #475569;
+}
+:root.light .bg-black\/30 {
+  background: rgba(15, 23, 42, 0.04);
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* 隱藏 scrollbar 但可捲動 */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@keyframes pop {
+  0% {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  50% {
+    transform: scale(1.15);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+.animate-pop {
+  animation: pop 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes riseIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-rise {
+  animation: riseIn 0.4s ease both;
+}
+
+input[type="range"] {
+  accent-color: var(--accent);
+}
