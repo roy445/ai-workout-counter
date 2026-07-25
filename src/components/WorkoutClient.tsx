@@ -42,6 +42,7 @@ export default function WorkoutClient() {
   const activeKeyRef = useRef<ExerciseKey>("squat");
   const detectingRef = useRef<boolean>(false);
   const detectStartRef = useRef<number>(0);
+  const portraitRef = useRef<boolean>(true);
   const lastVideoTimeRef = useRef<number>(-1);
   const lastFrameTsRef = useRef<number>(0);
   const activeMsRef = useRef<number>(0);
@@ -76,6 +77,7 @@ export default function WorkoutClient() {
   const [soundOn, setSoundOn] = useState(true);
   const [metronomeOn, setMetronomeOn] = useState(false);
   const [metronomeBpm, setMetronomeBpm] = useState(40);
+  const [portrait, setPortrait] = useState(true); // true=直式(全身)，false=橫式
   const [saveMsg, setSaveMsg] = useState("");
   const [popKey, setPopKey] = useState(0);
   const [personalBest, setPersonalBest] = useState(0);
@@ -149,7 +151,13 @@ export default function WorkoutClient() {
     if (ad !== null) setAutoDetect(ad === "1");
     const md = localStorage.getItem("workout_mode");
     if (md === "free" || md === "target") setMode(md);
+    const po = localStorage.getItem("workout_portrait");
+    if (po !== null) setPortrait(po === "1");
   }, []);
+  useEffect(() => {
+    portraitRef.current = portrait;
+    localStorage.setItem("workout_portrait", portrait ? "1" : "0");
+  }, [portrait]);
   useEffect(() => {
     localStorage.setItem("workout_auto", autoDetect ? "1" : "0");
   }, [autoDetect]);
@@ -556,11 +564,12 @@ export default function WorkoutClient() {
       getSound().unlock();
       getSpeech().speak("正在啟動鏡頭與 AI 模型");
 
+      // 直式時要求較高的畫面（手機可拍到全身），橫式則用一般 16:9
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: "user",
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: portraitRef.current ? 720 : 1280 },
+          height: { ideal: portraitRef.current ? 1280 : 720 },
         },
         audio: false,
       });
@@ -756,6 +765,17 @@ export default function WorkoutClient() {
           >
             {soundOn ? "🎵" : "🔕"}
           </button>
+          <button
+            onClick={() => setPortrait((v) => !v)}
+            className={`rounded-xl px-3 py-2 text-sm font-semibold transition ${
+              portrait
+                ? "bg-cyan-500 text-slate-900 shadow-lg shadow-cyan-500/20"
+                : "glass text-slate-300"
+            }`}
+            title={portrait ? "直式（照全身）" : "橫式"}
+          >
+            {portrait ? "📱 直式" : "🖥️ 橫式"}
+          </button>
           <ThemeToggle />
           <Link
             href="/history"
@@ -829,8 +849,16 @@ export default function WorkoutClient() {
 
       <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
         {/* 影像區 */}
-        <div className="relative overflow-hidden rounded-3xl bg-black shadow-2xl ring-1 ring-white/10">
-          <div className="relative aspect-video w-full">
+        <div
+          className={`relative mx-auto w-full overflow-hidden rounded-3xl bg-black shadow-2xl ring-1 ring-white/10 ${
+            portrait ? "max-w-[460px]" : ""
+          }`}
+        >
+          <div
+            className={`relative w-full ${
+              portrait ? "aspect-[9/16]" : "aspect-video"
+            }`}
+          >
             <video
               ref={videoRef}
               playsInline
