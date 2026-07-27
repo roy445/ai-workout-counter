@@ -33,7 +33,8 @@ export type ExerciseKey =
   | "jump"
   | "plank"
   | "march"
-  | "slowjog";
+  | "slowjog"
+  | "crotchclap";
 
 export type ExerciseDef = {
   key: ExerciseKey;
@@ -122,6 +123,16 @@ export const EXERCISES: Record<ExerciseKey, ExerciseDef> = {
     cue: "超慢跑開始，放鬆小步、保持節奏",
     unit: "步",
     targetCadence: 180,
+  },
+  crotchclap: {
+    key: "crotchclap",
+    name: "胯下擊掌",
+    emoji: "👏",
+    met: 7.0,
+    timeBased: false,
+    hint: "面向鏡頭，抬起單腳並在大腿下方雙手擊掌，左右輪流，每擊掌一次算一下。",
+    cue: "胯下擊掌開始，抬腳在胯下拍手",
+    unit: "下",
   },
 };
 
@@ -561,6 +572,62 @@ class SlowJogCounter implements RepCounter {
     };
   }
 }
+// 胯下擊掌：抬起單腳，於大腿下方雙手靠攏擊掌算一次。
+// 判定條件：有一腳膝蓋明顯抬起(高於髖) + 雙手腕距離很近(擊掌) + 手腕位置偏低(在胯下附近)。
+// 用「擊掌合起→分開」的循環避免同一次重複計數。
+class CrotchClapCounter implements RepCounter {
+  private clapped = false;
+  reset() {
+    this.clapped = false;
+  }
+  update(lms: Landmark[]): UpdateResult {
+    const hipY = avg(lms[LM.LEFT_HIP].y, lms[LM.RIGHT_HIP].y);
+    // 身高比例尺（肩到髖），讓門檻隨遠近自適應
+    const scale =
+      Math.abs(avg(lms[LM.LEFT_SHOULDER].y, lms[LM.RIGHT_SHOULDER].y) - hipY) ||
+      0.15;
+    const shoulderW =
+      Math.abs(lms[LM.LEFT_SHOULDER].x - lms[LM.RIGHT_SHOULDER].x) || 0.15;
+
+    // 是否有一腳抬起（膝蓋高於髖部一定幅度）
+    const kneeUp =
+      lms[LM.LEFT_KNEE].y < hipY - scale * 0.15 ||
+      lms[LM.RIGHT_KNEE].y < hipY - scale * 0.15;
+
+    // 雙手腕距離（擊掌時很近）
+    const wristDist = Math.hypot(
+      lms[LM.LEFT_WRIST].x - lms[LM.RIGHT_WRIST].x,
+      lms[LM.LEFT_WRIST].y - lms[LM.RIGHT_WRIST].y,
+    );
+    const handsTogether = wristDist < shoulderW * 0.5;
+
+    // 手腕偏低（在胯下附近，低於髖部）
+    const wristY = avg(lms[LM.LEFT_WRIST].y, lms[LM.RIGHT_WRIST].y);
+    const handsLow = wristY > hipY - scale * 0.2;
+
+    let repInc = 0;
+    let feedback = "";
+    if (kneeUp && handsTogether && handsLow) {
+      if (!this.clapped) {
+        this.clapped = true;
+        repInc = 1;
+      }
+    } else if (wristDist > shoulderW * 0.9) {
+      // 雙手明顯分開後，才允許下一次計數
+      this.clapped = false;
+    }
+
+    if (kneeUp && !handsLow) feedback = "手往胯下拍";
+    else if (kneeUp && !handsTogether && !this.clapped) feedback = "雙手靠攏擊掌";
+
+    return {
+      repInc,
+      phase: this.clapped ? "擊掌" : kneeUp ? "抬腳" : "準備",
+      progress: this.clapped ? 1 : kneeUp ? 0.5 : 0,
+      feedback,
+    };
+  }
+}
 
 export function createCounter(key: ExerciseKey): RepCounter {
   switch (key) {
@@ -580,6 +647,8 @@ export function createCounter(key: ExerciseKey): RepCounter {
       return new MarchCounter();
     case "slowjog":
       return new SlowJogCounter();
+    case "crotchclap":
+      return new CrotchClapCounter();
   }
 }
 
@@ -601,6 +670,7 @@ type Feat = {
   ankleSpread: number;
   shoulderW: number;
   torsoLen: number; // 肩到髖距離，作為身高比例尺
+  wristDist: number; // 雙手腕距離（擊掌時會變很近）
 };
 
 function range(arr: number[]): number {
@@ -657,6 +727,10 @@ export class AutoClassifier {
       ankleSpread: Math.abs(lms[LM.LEFT_ANKLE].x - lms[LM.RIGHT_ANKLE].x),
       shoulderW: Math.abs(lms[LM.LEFT_SHOULDER].x - lms[LM.RIGHT_SHOULDER].x),
       torsoLen: Math.abs(sy - hy) || 0.15,
+      wristDist: Math.hypot(
+        lms[LM.LEFT_WRIST].x - lms[LM.RIGHT_WRIST].x,
+        lms[LM.LEFT_WRIST].y - lms[LM.RIGHT_WRIST].y,
+      ),
     });
     if (this.buf.length > this.cap) this.buf.shift();
   }
@@ -699,8 +773,13 @@ export class AutoClassifier {
     const ankleAltR = range(b.map((f) => f.lAnkleY - f.rAnkleY)) / scale;
     const kneeDiffNorm = kneeDiffR / scale;
 
+    // 雙手腕距離的變化幅度（擊掌會忽近忽遠）
+    const wristDistR = range(b.map((f) => f.wristDist)) / shoulderW;
+
     if (wristAboveFrac > 0.25 && ankleRnorm > 0.4) return "jumpingjack";
-    // 原地踏步：抬膝明顯（膝蓋高低差大）
+    // 胯下擊掌：有抬膝 + 雙手距離大幅開合（擊掌）
+    if (kneeDiffNorm > 0.4 && wristDistR > 0.6) return "crotchclap";
+    // 原地踏步：抬膝明顯（膝蓋高低差大）、手沒有明顯開合
     if (kneeDiffNorm > 0.5 && hipYR < 0.05) return "march";
     // 超慢跑：腳踝小幅交替上下、抬膝不明顯、身體不太起伏
     if (
