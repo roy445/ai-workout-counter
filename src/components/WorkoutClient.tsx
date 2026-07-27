@@ -43,6 +43,7 @@ export default function WorkoutClient() {
   const detectingRef = useRef<boolean>(false);
   const detectStartRef = useRef<number>(0);
   const portraitRef = useRef<boolean>(true);
+  const facingRef = useRef<"user" | "environment">("user");
   const lastVideoTimeRef = useRef<number>(-1);
   const lastFrameTsRef = useRef<number>(0);
   const activeMsRef = useRef<number>(0);
@@ -78,6 +79,7 @@ export default function WorkoutClient() {
   const [metronomeOn, setMetronomeOn] = useState(false);
   const [metronomeBpm, setMetronomeBpm] = useState(40);
   const [portrait, setPortrait] = useState(true); // true=直式(全身)，false=橫式
+  const [facing, setFacing] = useState<"user" | "environment">("user"); // 前/後鏡頭
   const [saveMsg, setSaveMsg] = useState("");
   const [popKey, setPopKey] = useState(0);
   const [personalBest, setPersonalBest] = useState(0);
@@ -159,6 +161,9 @@ export default function WorkoutClient() {
     localStorage.setItem("workout_portrait", portrait ? "1" : "0");
   }, [portrait]);
   useEffect(() => {
+    facingRef.current = facing;
+  }, [facing]);
+  useEffect(() => {
     localStorage.setItem("workout_auto", autoDetect ? "1" : "0");
   }, [autoDetect]);
   useEffect(() => {
@@ -237,7 +242,9 @@ export default function WorkoutClient() {
     ctx.clearRect(0, 0, w, h);
     if (!lms) return;
 
-    const px = (x: number) => (1 - x) * w;
+    // 前鏡頭畫面左右鏡像，骨架也要跟著鏡像；後鏡頭則維持原方向
+    const mirror = facingRef.current === "user";
+    const px = (x: number) => (mirror ? 1 - x : x) * w;
     const py = (y: number) => y * h;
     const lineColor = ok ? "#22d3ee" : "#f59e0b";
 
@@ -564,10 +571,15 @@ export default function WorkoutClient() {
       getSound().unlock();
       getSpeech().speak("正在啟動鏡頭與 AI 模型");
 
+      // 先關掉舊的串流（切換鏡頭時）
+      const oldVideo = videoRef.current;
+      if (oldVideo && oldVideo.srcObject) {
+        (oldVideo.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+      }
       // 直式時要求較高的畫面（手機可拍到全身），橫式則用一般 16:9
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          facingMode: "user",
+          facingMode: { ideal: facingRef.current },
           width: { ideal: portraitRef.current ? 720 : 1280 },
           height: { ideal: portraitRef.current ? 1280 : 720 },
         },
@@ -601,6 +613,34 @@ export default function WorkoutClient() {
       );
     }
   }, [loop]);
+
+  // 切換前/後鏡頭（只換攝影機串流，不重載模型）
+  const swapCamera = useCallback(async () => {
+    const next = facingRef.current === "user" ? "environment" : "user";
+    facingRef.current = next;
+    setFacing(next);
+    // 若鏡頭尚未開啟，只更新設定即可
+    const video = videoRef.current;
+    if (!video || !video.srcObject) return;
+    try {
+      (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: next },
+          width: { ideal: portraitRef.current ? 720 : 1280 },
+          height: { ideal: portraitRef.current ? 1280 : 720 },
+        },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+      smootherRef.current.reset();
+      getSpeech().speak(next === "user" ? "已切換前鏡頭" : "已切換後鏡頭");
+    } catch (e) {
+      console.error(e);
+      setErrorMsg("切換鏡頭失敗，此裝置可能沒有另一顆鏡頭。");
+    }
+  }, []);
 
   // 開始運動（3 秒語音倒數）
   const start = useCallback(() => {
@@ -776,6 +816,13 @@ export default function WorkoutClient() {
           >
             {portrait ? "📱 直式" : "🖥️ 橫式"}
           </button>
+          <button
+            onClick={swapCamera}
+            className="rounded-xl glass px-3 py-2 text-sm font-semibold text-white transition hover:bg-white/10"
+            title="切換前 / 後鏡頭（後鏡頭視野較廣）"
+          >
+            🔄 {facing === "user" ? "前鏡頭" : "後鏡頭"}
+          </button>
           <ThemeToggle />
           <Link
             href="/history"
@@ -863,11 +910,13 @@ export default function WorkoutClient() {
               ref={videoRef}
               playsInline
               muted
-              className="absolute inset-0 h-full w-full -scale-x-100 object-cover"
+              className={`absolute inset-0 h-full w-full object-contain ${
+                facing === "user" ? "-scale-x-100" : ""
+              }`}
             />
             <canvas
               ref={canvasRef}
-              className="absolute inset-0 h-full w-full object-cover"
+              className="absolute inset-0 h-full w-full object-contain"
             />
 
             {/* 狀態標籤 */}
