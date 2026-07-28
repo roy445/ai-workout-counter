@@ -1,27 +1,28 @@
-# Render Blueprint：一鍵建立「Web 服務 + PostgreSQL 資料庫」
-# 在 Render → New → Blueprint，選這個 repo 即可自動部署。
-databases:
-  - name: workout-db
-    databaseName: app_db
-    user: app_user
-    plan: free
-
 services:
   - type: web
     name: ai-workout-counter
     runtime: node
+    region: singapore
     plan: free
-    # 建置：安裝套件並打包
-    buildCommand: npm install && npm run build
-    # 啟動前先套用資料表（drizzle-kit push 為冪等操作），再啟動 Next.js
-    startCommand: npx drizzle-kit push --force && npx next start -p $PORT
+    buildCommand: npm ci && npm run build
+    preDeployCommand: npx drizzle-kit push
+    startCommand: npm start
     healthCheckPath: /api/health
-    autoDeploy: true
+    autoDeployTrigger: commit
     envVars:
-      # 從上面建立的資料庫自動帶入連線字串（內部連線）
+      - key: NODE_VERSION
+        value: 22.22.0
+      - key: NODE_ENV
+        value: production
       - key: DATABASE_URL
         fromDatabase:
-          name: workout-db
+          name: ai-workout-counter-db
           property: connectionString
-      - key: NODE_VERSION
-        value: "20"
+
+databases:
+  - name: ai-workout-counter-db
+    databaseName: ai_workout_counter
+    user: ai_workout_counter
+    region: singapore
+    plan: free
+    ipAllowList: []
