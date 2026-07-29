@@ -646,10 +646,37 @@ export default function WorkoutApp() {
 
     const pc = new RTCPeerConnection(WEBRTC_CONFIG);
     remotePcRef.current = pc;
+    pc.addTransceiver("video", { direction: "recvonly" });
+
+    const sendHostOffer = async (iceRestart = false): Promise<boolean> => {
+      if (pc.signalingState === "closed") return false;
+
+      try {
+        if (
+          pc.signalingState === "have-local-offer" &&
+          pc.localDescription
+        ) {
+          return await postSignal(code, "host", "offer", {
+            type: pc.localDescription.type,
+            sdp: pc.localDescription.sdp,
+          });
+        }
+
+        if (pc.signalingState !== "stable") return false;
+        const offer = await pc.createOffer({ iceRestart });
+        await pc.setLocalDescription(offer);
+        return await postSignal(code, "host", "offer", {
+          type: offer.type,
+          sdp: offer.sdp,
+        });
+      } catch {
+        return false;
+      }
+    };
 
     pc.ontrack = (event) => {
-      const stream = event.streams[0];
-      if (!stream) return;
+      const stream =
+        event.streams[0] || new MediaStream([event.track]);
 
       try {
         const receiver = event.receiver as RTCRtpReceiver & {
@@ -658,7 +685,9 @@ export default function WorkoutApp() {
         };
         receiver.playoutDelayHint = 0;
         receiver.jitterBufferTarget = 0;
-      } catch { /* experimental low-latency hints are optional */ }
+      } catch {
+        // Low-latency receiver hints are not supported by every browser.
+      }
 
       let remoteVideo = remoteVideoRef.current;
       if (!remoteVideo) {
@@ -674,17 +703,31 @@ export default function WorkoutApp() {
       void remoteVideo.play();
 
       setCameras((previous) => {
-        const withoutCurrent = previous.filter((camera) => camera.id !== `remote-${code}`);
+        const withoutCurrent = previous.filter(
+          (camera) => camera.id !== `remote-${code}`,
+        );
         return [
           ...withoutCurrent,
-          { id: `remote-${code}`, label: `手機鏡頭 ${code}`, type: "remote", status: "active", stream, personCount: 0 },
+          {
+            id: `remote-${code}`,
+            label: `手機鏡頭 ${code}`,
+            type: "remote",
+            status: "active",
+            stream,
+            personCount: 0,
+          },
         ];
       });
     };
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        void postSignal(code, "host", "candidate", event.candidate.toJSON());
+        void postSignal(
+          code,
+          "host",
+          "candidate",
+          event.candidate.toJSON(),
+        );
       }
     };
 
@@ -693,60 +736,106 @@ export default function WorkoutApp() {
         setRemoteConnected(true);
         setRemoteStatus("connected");
         setRemoteError("");
-        if (voiceOnRef.current) speak("遠端手機鏡頭已連線，可以在鏡頭清單中切換", "high", "remote-connected", 0);
+        if (voiceOnRef.current) {
+          speak(
+            "遠端手機鏡頭已連線，可以在鏡頭清單中切換",
+            "high",
+            "remote-connected",
+            0,
+          );
+        }
       } else if (pc.connectionState === "connecting") {
         setRemoteStatus("negotiating");
       } else if (pc.connectionState === "failed") {
         setRemoteConnected(false);
         setRemoteStatus("failed");
-        setRemoteError("目前網路可能限制點對點連線，正在要求手機重新建立連線");
-        void postSignal(code, "host", "restart", { at: Date.now() });
+        setRemoteError(
+          "裝置已交換連線資訊，但目前網路阻擋 P2P。請改用同一個 Wi-Fi，或設定 TURN。",
+        );
       } else if (pc.connectionState === "disconnected") {
         setRemoteStatus("negotiating");
+        setRemoteError("手機影像暫時中斷，正在等待恢復");
       }
     };
 
+    // The host creates the room offer before the phone opens the link.
+    const offerSent = await sendHostOffer();
+    if (!offerSent) {
+      setRemoteStatus("failed");
+      setRemoteError(
+        "無法建立連線房間。請確認 Vercel 已設定 DATABASE_URL，並建立 signaling 資料表。",
+      );
+      return;
+    }
     setRemoteStatus("waiting");
 
     while (!remoteStoppedRef.current && remotePcRef.current === pc) {
-      const messages = await getSignals(code, "host", remoteLastIdRef.current);
+      const messages = await getSignals(
+        code,
+        "host",
+        remoteLastIdRef.current,
+      );
 
       for (const message of messages) {
-        remoteLastIdRef.current = Math.max(remoteLastIdRef.current, message.id);
+        remoteLastIdRef.current = Math.max(
+          remoteLastIdRef.current,
+          message.id,
+        );
 
         if (message.msgType === "ready") {
           setRemoteStatus("negotiating");
-        } else if (message.msgType === "offer") {
-          const offer = parseSignal<RTCSessionDescriptionInit>(message);
-          if (!offer) continue;
+          // Repost the same offer so a newly opened phone sees it immediately.
+          if (
+            pc.signalingState === "have-local-offer" &&
+            pc.localDescription
+          ) {
+            await postSignal(code, "host", "offer", {
+              type: pc.localDescription.type,
+              sdp: pc.localDescription.sdp,
+            });
+          }
+        } else if (message.msgType === "answer") {
+          const answer = parseSignal<RTCSessionDescriptionInit>(message);
+          if (!answer || answer.type !== "answer") continue;
+
           try {
-            setRemoteStatus("negotiating");
-            await pc.setRemoteDescription(offer);
-            const queued = remotePendingCandidatesRef.current.splice(0);
-            for (const candidate of queued) {
-              try { await pc.addIceCandidate(candidate); } catch { /* ignore stale candidate */ }
+            if (pc.signalingState === "have-local-offer") {
+              setRemoteStatus("negotiating");
+              await pc.setRemoteDescription(answer);
+              const queued = remotePendingCandidatesRef.current.splice(0);
+              for (const candidate of queued) {
+                try {
+                  await pc.addIceCandidate(candidate);
+                } catch {
+                  // Ignore candidates from an older negotiation.
+                }
+              }
             }
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            await postSignal(code, "host", "answer", { type: answer.type, sdp: answer.sdp });
           } catch {
             setRemoteStatus("failed");
-            setRemoteError("交換連線資訊失敗，請按重新等待後再試");
+            setRemoteError("收到手機回覆，但套用連線資訊失敗");
           }
         } else if (message.msgType === "candidate") {
           const candidate = parseSignal<RTCIceCandidateInit>(message);
           if (!candidate) continue;
           if (pc.remoteDescription) {
-            try { await pc.addIceCandidate(candidate); } catch { /* ignore stale candidate */ }
+            try {
+              await pc.addIceCandidate(candidate);
+            } catch {
+              // Ignore stale ICE candidates.
+            }
           } else {
             remotePendingCandidatesRef.current.push(candidate);
           }
-        } else if (message.msgType === "bye" && pc.connectionState !== "connected") {
+        } else if (
+          message.msgType === "bye" &&
+          pc.connectionState !== "connected"
+        ) {
           setRemoteStatus("waiting");
         }
       }
 
-      await wait(pc.connectionState === "connected" ? 1000 : 300);
+      await wait(pc.connectionState === "connected" ? 1000 : 350);
     }
   }, []);
 
@@ -760,11 +849,14 @@ export default function WorkoutApp() {
     void startRemoteHost(code);
   }, [startRemoteHost]);
 
-  const retryRemote = useCallback(() => {
+  const retryRemote = useCallback(async () => {
     if (!roomCode) return;
     remoteStoppedRef.current = true;
     remotePcRef.current?.close();
-    window.setTimeout(() => void startRemoteHost(roomCode), 250);
+    setRemoteStatus("preparing");
+    setRemoteError("");
+    await clearSignalRoom(roomCode);
+    void startRemoteHost(roomCode);
   }, [roomCode, startRemoteHost]);
 
   const cancelRemoteSetup = useCallback(() => {
