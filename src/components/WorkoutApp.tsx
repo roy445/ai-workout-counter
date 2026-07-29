@@ -895,18 +895,40 @@ export default function WorkoutApp() {
 
   const switchToCamera = useCallback((cameraId: string) => {
     const camera = camerasRef.current.find((item) => item.id === cameraId);
-    if (!camera?.stream || !videoRef.current) return;
+    if (!camera?.stream || !videoRef.current) {
+      console.warn("Camera or stream not found for ID:", cameraId);
+      return;
+    }
 
     setActiveCameraId(cameraId);
     activeCameraRef.current = cameraId;
-    videoRef.current.srcObject = camera.stream;
-    void videoRef.current.play();
-    lastTimeRef.current = -1;
-    lastInferenceAtRef.current = 0;
-    lastResultRef.current = null;
-    lastDimensionsRef.current = { width: 0, height: 0 };
-    primaryCenterRef.current = null;
-    setPersonDetected(false);
+
+    // Reset video player parameters explicitly
+    const video = videoRef.current;
+    video.pause();
+    video.srcObject = camera.stream;
+    video.muted = true;
+    video.playsInline = true;
+
+    // Force reloading of stream dimensions on metadata load
+    video.onloadedmetadata = () => {
+      if (video.videoWidth && video.videoHeight) {
+        setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
+        lastDimensionsRef.current = { width: video.videoWidth, height: video.videoHeight };
+      }
+    };
+
+    video.play()
+      .then(() => {
+        lastTimeRef.current = -1;
+        lastInferenceAtRef.current = 0;
+        lastResultRef.current = null;
+        primaryCenterRef.current = null;
+        setPersonDetected(false);
+      })
+      .catch((error) => {
+        console.error("Failed to play switched camera stream:", error);
+      });
   }, []);
 
   /* ---- exercise handlers ---- */
