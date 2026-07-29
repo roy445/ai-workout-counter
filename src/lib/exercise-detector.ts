@@ -52,6 +52,7 @@ export interface ExerciseState {
   reps: number;
   quality: number;
   qualityHistory: number[];
+  pendingRepQuality: number;
   feedback: Feedback[];
   isActive: boolean;
   startTime: number;
@@ -61,7 +62,7 @@ export interface ExerciseState {
 }
 
 // Minimum time between reps to avoid double counting (ms)
-const MIN_REP_INTERVAL = 400;
+const MIN_REP_INTERVAL = 450;
 
 export function createExerciseState(type: ExerciseType): ExerciseState {
   return {
@@ -70,6 +71,7 @@ export function createExerciseState(type: ExerciseType): ExerciseState {
     reps: 0,
     quality: 100,
     qualityHistory: [],
+    pendingRepQuality: 100,
     feedback: [],
     isActive: false,
     startTime: 0,
@@ -94,6 +96,9 @@ function addFeedback(
     return;
   }
   state.feedback.push({ message, type, timestamp: now });
+  if (type === "warning") {
+    state.pendingRepQuality = Math.max(50, state.pendingRepQuality - 12);
+  }
   // Keep only last 5 messages
   if (state.feedback.length > 5) {
     state.feedback = state.feedback.slice(-5);
@@ -104,14 +109,16 @@ function countRep(state: ExerciseState, quality: number): void {
   const now = Date.now();
   if (now - state.lastRepTime < MIN_REP_INTERVAL) return;
 
+  const finalQuality = Math.max(45, Math.min(100, Math.round(Math.min(quality, state.pendingRepQuality))));
   state.reps++;
   state.lastRepTime = now;
-  state.qualityHistory.push(quality);
+  state.qualityHistory.push(finalQuality);
   state.quality = Math.round(
     state.qualityHistory.reduce((a, b) => a + b, 0) /
       state.qualityHistory.length
   );
-  addFeedback(state, `✅ 完成第 ${state.reps} 次！品質: ${quality}%`, "success");
+  state.pendingRepQuality = 100;
+  addFeedback(state, `✅ 完成第 ${state.reps} 次！品質: ${finalQuality}%`, "success");
 }
 
 // ===== SQUAT DETECTOR =====

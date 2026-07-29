@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import { Point3D, POSE_CONNECTIONS, LANDMARK } from "@/lib/pose-utils";
 import {
   ExerciseType,
@@ -18,11 +19,24 @@ import {
   announceExerciseStop,
   announceFormCorrection,
   announceChallenge,
+  announceChallengeProgress,
   announcePersonLost,
+  announcePersonFound,
   announceMultiplePeople,
+  announceCameraBlurred,
+  announceStatus,
   setVoiceEnabled,
-  isVoiceEnabled,
+  unlockVoice,
 } from "@/lib/voice-coach";
+import {
+  WEBRTC_CONFIG,
+  clearSignalRoom,
+  getSignals,
+  parseSignal,
+  postSignal,
+  tuneVideoSender,
+  wait,
+} from "@/lib/webrtc";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -32,8 +46,11 @@ interface PoseLandmarkerResult {
   worldLandmarks: Point3D[][];
 }
 type MpPoseLandmarker = {
-  detectForVideo(v: HTMLVideoElement, ts: number): PoseLandmarkerResult;
+  detectForVideo(source: CanvasImageSource, timestamp: number): PoseLandmarkerResult;
 };
+
+type RemoteConnectionStatus = "idle" | "preparing" | "waiting" | "negotiating" | "connected" | "failed";
+type CameraQuality = "clear" | "fair" | "blurred";
 
 interface CameraSource {
   id: string;
@@ -160,6 +177,82 @@ function fmt(s: number) {
   return `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 }
 
+function poseCenter(pose: Point3D[]): { x: number; y: number } {
+  const leftHip = pose[LANDMARK.LEFT_HIP];
+  const rightHip = pose[LANDMARK.RIGHT_HIP];
+  return { x: (leftHip.x + rightHip.x) / 2, y: (leftHip.y + rightHip.y) / 2 };
+}
+
+/** Keep tracking the same person; otherwise choose the largest, clearest body. */
+function selectPrimaryPose(
+  poses: Point3D[][],
+  previousCenter: { x: number; y: number } | null
+): Point3D[] | null {
+  if (poses.length === 0) return null;
+  let best: Point3D[] | null = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const pose of poses) {
+    const visible = pose.filter((point) => (point.visibility ?? 0) > 0.35);
+    if (visible.length < 8) continue;
+    const minX = Math.min(...visible.map((point) => point.x));
+    const maxX = Math.max(...visible.map((point) => point.x));
+    const minY = Math.min(...visible.map((point) => point.y));
+    const maxY = Math.max(...visible.map((point) => point.y));
+    const area = Math.max(0, maxX - minX) * Math.max(0, maxY - minY);
+    const visibility = visible.reduce((sum, point) => sum + (point.visibility ?? 0), 0) / visible.length;
+    const center = poseCenter(pose);
+    const distancePenalty = previousCenter
+      ? Math.hypot(center.x - previousCenter.x, center.y - previousCenter.y) * 0.45
+      : 0;
+    const score = area * 1.8 + visibility - distancePenalty;
+    if (score > bestScore) {
+      bestScore = score;
+      best = pose;
+    }
+  }
+  return best;
+}
+
+function poseCompleteness(pose: Point3D[]): number {
+  const pairs: [number, number][] = [
+    [LANDMARK.LEFT_SHOULDER, LANDMARK.RIGHT_SHOULDER],
+    [LANDMARK.LEFT_ELBOW, LANDMARK.RIGHT_ELBOW],
+    [LANDMARK.LEFT_WRIST, LANDMARK.RIGHT_WRIST],
+    [LANDMARK.LEFT_HIP, LANDMARK.RIGHT_HIP],
+    [LANDMARK.LEFT_KNEE, LANDMARK.RIGHT_KNEE],
+    [LANDMARK.LEFT_ANKLE, LANDMARK.RIGHT_ANKLE],
+  ];
+  return pairs.reduce((sum, [left, right]) => {
+    return sum + Math.max(pose[left]?.visibility ?? 0, pose[right]?.visibility ?? 0);
+  }, 0) / pairs.length;
+}
+
+/** Fast edge score. It detects defocus; it does not alter or upload the image. */
+function estimateSharpness(ctx: CanvasRenderingContext2D, width: number, height: number): number {
+  try {
+    const pixels = ctx.getImageData(0, 0, width, height).data;
+    const step = 8;
+    let total = 0;
+    let count = 0;
+    for (let y = step; y < height; y += step) {
+      for (let x = step; x < width; x += step) {
+        const index = (y * width + x) * 4;
+        const left = (y * width + x - step) * 4;
+        const up = ((y - step) * width + x) * 4;
+        const lum = pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114;
+        const leftLum = pixels[left] * 0.299 + pixels[left + 1] * 0.587 + pixels[left + 2] * 0.114;
+        const upLum = pixels[up] * 0.299 + pixels[up + 1] * 0.587 + pixels[up + 2] * 0.114;
+        total += Math.abs(lum - leftLum) + Math.abs(lum - upLum);
+        count += 2;
+      }
+    }
+    return count > 0 ? total / count : 0;
+  } catch {
+    return 20;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  MAIN COMPONENT                                                     */
 /* ------------------------------------------------------------------ */
@@ -167,9 +260,16 @@ export default function WorkoutApp() {
   /* refs */
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const landmarkerRef = useRef<MpPoseLandmarker | null>(null);
   const animRef = useRef(0);
   const lastTimeRef = useRef(-1);
+  const lastInferenceAtRef = useRef(0);
+  const lastResultRef = useRef<PoseLandmarkerResult | null>(null);
+  const lastBlurCheckRef = useRef(0);
+  const primaryCenterRef = useRef<{ x: number; y: number } | null>(null);
+  const lastDimensionsRef = useRef({ width: 0, height: 0 });
+  const personWasDetectedRef = useRef(false);
 
   /* state */
   const [status, setStatus] = useState<string>("loading");
@@ -188,17 +288,26 @@ export default function WorkoutApp() {
   const [challengeCompleted, setChallengeCompleted] = useState(false);
   const [voiceOn, setVoiceOn] = useState(true);
   const [mobileTab, setMobileTab] = useState<"cam" | "stats" | "cameras">("cam");
+  const [cameraQuality, setCameraQuality] = useState<CameraQuality>("clear");
+  const [inferenceMs, setInferenceMs] = useState(0);
+  const [poseCoverage, setPoseCoverage] = useState(0);
+  const [videoDimensions, setVideoDimensions] = useState({ width: 1280, height: 720 });
 
   // Camera management
   const [cameras, setCameras] = useState<CameraSource[]>([]);
   const [activeCameraId, setActiveCameraId] = useState("local-default");
+  const [localFacing, setLocalFacing] = useState<"user" | "environment">("user");
   const [showCameraPanel, setShowCameraPanel] = useState(false);
   const [roomCode, setRoomCode] = useState("");
   const [showRemoteSetup, setShowRemoteSetup] = useState(false);
   const [remoteConnected, setRemoteConnected] = useState(false);
+  const [remoteStatus, setRemoteStatus] = useState<RemoteConnectionStatus>("idle");
+  const [remoteError, setRemoteError] = useState("");
+  const [linkCopied, setLinkCopied] = useState(false);
   const remotePcRef = useRef<RTCPeerConnection | null>(null);
-  const remotePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const remoteStoppedRef = useRef(false);
   const remoteLastIdRef = useRef(0);
+  const remotePendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
 
   /* mutable refs for closures */
@@ -212,15 +321,27 @@ export default function WorkoutApp() {
   const prevFeedbackLen = useRef(0);
   const personLostTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const multiPersonTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const camerasRef = useRef(cameras);
+  camerasRef.current = cameras;
+  const activeCameraRef = useRef(activeCameraId);
+  activeCameraRef.current = activeCameraId;
+  const voiceOnRef = useRef(voiceOn);
+  voiceOnRef.current = voiceOn;
+  const cameraQualityRef = useRef<CameraQuality>(cameraQuality);
+  cameraQualityRef.current = cameraQuality;
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   /* ---- voice announcements triggered by state changes ---- */
   useEffect(() => {
     if (!voiceOn) return;
     if (exerciseState.reps > prevReps.current && exerciseState.reps > 0) {
-      announceRep(exerciseState.reps);
+      const shouldSpeak = selectedExercise !== "plank" || exerciseState.reps % 5 === 0;
+      if (shouldSpeak) announceRep(exerciseState.reps, exerciseState.quality);
+      if (challengeMode) announceChallengeProgress(exerciseState.reps, challengeTarget);
     }
     prevReps.current = exerciseState.reps;
-  }, [exerciseState.reps, voiceOn]);
+  }, [exerciseState.reps, exerciseState.quality, voiceOn, selectedExercise, challengeMode, challengeTarget]);
 
   useEffect(() => {
     if (!voiceOn) return;
@@ -233,180 +354,262 @@ export default function WorkoutApp() {
     prevFeedbackLen.current = exerciseState.feedback.length;
   }, [exerciseState.feedback, voiceOn]);
 
-  /* ---- init camera with HD resolution ---- */
+  useEffect(() => {
+    if (voiceOn && isTracking) announceStatus(exerciseState.phase);
+  }, [exerciseState.phase, isTracking, voiceOn]);
+
+  /* ---- init camera with HD display stream ---- */
   const initCamera = useCallback(async (facingMode: "user" | "environment" = "user") => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+        video: {
+          facingMode: { ideal: facingMode },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30, min: 24 },
+        },
         audio: false,
       });
+      const track = stream.getVideoTracks()[0];
+      if (track) {
+        track.contentHint = "motion";
+        try {
+          await track.applyConstraints({
+            advanced: ([{ focusMode: "continuous" }] as unknown) as MediaTrackConstraintSet[],
+          });
+        } catch { /* autofocus control is optional */ }
+        const settings = track.getSettings();
+        if (settings.width && settings.height) {
+          setVideoDimensions({ width: settings.width, height: settings.height });
+        }
+      }
+      setLocalFacing(facingMode);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
-      setCameras((prev) => {
-        const without = prev.filter((c) => c.id !== "local-default");
+      setCameras((previous) => {
+        const withoutLocal = previous.filter((camera) => camera.id !== "local-default");
         return [
-          ...without,
-          { id: "local-default", label: "本機鏡頭", type: "local", status: "active", stream, personCount: 0 },
+          { id: "local-default", label: facingMode === "user" ? "本機前鏡頭" : "本機後鏡頭", type: "local", status: "active", stream, personCount: 0 },
+          ...withoutLocal,
         ];
       });
+      return stream;
     } catch {
       setStatus("error");
+      return null;
     }
   }, []);
 
-  /* ---- init pose detector (with multi-pose support) ---- */
+  /* ---- accurate model on a smaller analysis frame ---- */
   const initPose = useCallback(async () => {
     setStatus("loading");
     try {
       const { PoseLandmarker, FilesetResolver } = await import("@mediapipe/tasks-vision");
-      const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
-      let lm: unknown;
+      const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
+      const fullModel = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
+      const liteModel = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+      let landmarker: unknown;
       try {
-        lm = await PoseLandmarker.createFromOptions(fs, {
-          baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-            delegate: "GPU",
-          },
+        landmarker = await PoseLandmarker.createFromOptions(files, {
+          baseOptions: { modelAssetPath: fullModel, delegate: "GPU" },
           runningMode: "VIDEO",
-          numPoses: 3,
-          minPoseDetectionConfidence: 0.5,
-          minPosePresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5,
+          numPoses: 2,
+          minPoseDetectionConfidence: 0.58,
+          minPosePresenceConfidence: 0.58,
+          minTrackingConfidence: 0.58,
         });
       } catch {
-        lm = await PoseLandmarker.createFromOptions(fs, {
-          baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-          },
+        landmarker = await PoseLandmarker.createFromOptions(files, {
+          baseOptions: { modelAssetPath: liteModel },
           runningMode: "VIDEO",
-          numPoses: 3,
+          numPoses: 2,
+          minPoseDetectionConfidence: 0.52,
+          minPosePresenceConfidence: 0.52,
+          minTrackingConfidence: 0.52,
         });
       }
-      landmarkerRef.current = lm as unknown as MpPoseLandmarker;
+      landmarkerRef.current = landmarker as MpPoseLandmarker;
+      analysisCanvasRef.current = document.createElement("canvas");
       setStatus("ready");
     } catch {
       setStatus("error");
     }
   }, []);
 
-  /* ---- detection loop ---- */
+  /* ---- display at source quality; infer at ~20 FPS on max 640px ---- */
   const loop = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    const lm = landmarkerRef.current;
-    if (!video || !canvas || !lm || video.readyState < 2) { animRef.current = requestAnimationFrame(loop); return; }
+    const landmarker = landmarkerRef.current;
+    if (!video || !canvas || !landmarker || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+      animRef.current = requestAnimationFrame(loop);
+      return;
+    }
 
     const ctx = canvas.getContext("2d", { alpha: false });
-    if (!ctx) { animRef.current = requestAnimationFrame(loop); return; }
+    if (!ctx) {
+      animRef.current = requestAnimationFrame(loop);
+      return;
+    }
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
+    const sourceWidth = video.videoWidth;
+    const sourceHeight = video.videoHeight;
+    if (lastDimensionsRef.current.width !== sourceWidth || lastDimensionsRef.current.height !== sourceHeight) {
+      canvas.width = sourceWidth;
+      canvas.height = sourceHeight;
+      lastDimensionsRef.current = { width: sourceWidth, height: sourceHeight };
+      setVideoDimensions({ width: sourceWidth, height: sourceHeight });
+    }
 
     if (video.currentTime !== lastTimeRef.current) {
       lastTimeRef.current = video.currentTime;
-      try {
-        const res = lm.detectForVideo(video, performance.now());
+      const isLocal = camerasRef.current.find((camera) => camera.id === activeCameraRef.current)?.type !== "remote";
 
-        // Draw video (mirrored for local)
-        const isLocal = cameras.find((c) => c.id === activeCameraId)?.type !== "remote";
-        ctx.save();
-        if (isLocal) { ctx.scale(-1, 1); ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height); }
-        else { ctx.drawImage(video, 0, 0, canvas.width, canvas.height); }
-        ctx.restore();
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.save();
+      if (isLocal) {
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+      } else {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+      ctx.restore();
 
-        const poseCount = res.landmarks?.length || 0;
+      const now = performance.now();
+      if (now - lastInferenceAtRef.current >= 50) {
+        lastInferenceAtRef.current = now;
+        const analysis = analysisCanvasRef.current || document.createElement("canvas");
+        analysisCanvasRef.current = analysis;
+        const aspect = sourceWidth / sourceHeight;
+        analysis.width = aspect >= 1 ? 640 : Math.max(320, Math.round(640 * aspect));
+        analysis.height = aspect >= 1 ? Math.max(320, Math.round(640 / aspect)) : 640;
+        const analysisCtx = analysis.getContext("2d", { willReadFrequently: true });
 
-        // Multi-person detection
-        if (poseCount > 1) {
-          setMultiPerson(true);
-          if (!multiPersonTimer.current) {
-            multiPersonTimer.current = setTimeout(() => {
-              if (voiceOn) announceMultiplePeople();
-              multiPersonTimer.current = null;
-            }, 3000);
-          }
-        } else {
-          setMultiPerson(false);
-          if (multiPersonTimer.current) { clearTimeout(multiPersonTimer.current); multiPersonTimer.current = null; }
-        }
+        if (analysisCtx) {
+          analysisCtx.drawImage(video, 0, 0, analysis.width, analysis.height);
 
-        if (poseCount > 0) {
-          setPersonDetected(true);
-          if (personLostTimer.current) { clearTimeout(personLostTimer.current); personLostTimer.current = null; }
-
-          // Always use first (largest / most confident) person
-          const raw = res.landmarks[0] as Point3D[];
-          const mirrored = isLocal ? raw.map((p) => ({ ...p, x: 1 - p.x })) : raw;
-
-          if (status !== "detecting" && trackRef.current) setStatus("detecting");
-
-          drawSkeleton(ctx, mirrored, canvas.width, canvas.height, stateRef.current.quality);
-
-          if (trackRef.current) {
-            const ns = detectExercise(exRef.current, raw, { ...stateRef.current });
-            setExerciseState(ns);
+          if (now - lastBlurCheckRef.current > 1200) {
+            lastBlurCheckRef.current = now;
+            const sharpness = estimateSharpness(analysisCtx, analysis.width, analysis.height);
+            const quality: CameraQuality = sharpness < 6 ? "blurred" : sharpness < 11 ? "fair" : "clear";
+            cameraQualityRef.current = quality;
+            setCameraQuality(quality);
+            if (quality === "blurred" && trackRef.current && voiceOnRef.current) announceCameraBlurred();
           }
 
-          // HUD: phase + person count
-          if (trackRef.current) {
-            const hudH = 40;
-            ctx.fillStyle = "rgba(0,0,0,0.55)";
-            ctx.fillRect(0, 0, 300, hudH);
-            ctx.font = `bold ${Math.max(14, Math.round(canvas.width / 55))}px system-ui, sans-serif`;
-            ctx.fillStyle = "#00ff88";
-            ctx.fillText(`動作: ${stateRef.current.phase}`, 10, hudH * 0.65);
+          try {
+            const inferenceStart = performance.now();
+            const result = landmarker.detectForVideo(analysis, inferenceStart);
+            setInferenceMs(Math.round(performance.now() - inferenceStart));
+            lastResultRef.current = result;
+
+            const poses = (result.landmarks || []) as Point3D[][];
+            const poseCount = poses.length;
+            const primary = selectPrimaryPose(poses, primaryCenterRef.current);
+            const coverage = primary ? poseCompleteness(primary) : 0;
+            setPoseCoverage(Math.round(coverage * 100));
 
             if (poseCount > 1) {
-              ctx.fillStyle = "rgba(255,60,60,0.7)";
-              ctx.fillRect(canvas.width - 200, 0, 200, hudH);
-              ctx.fillStyle = "#fff";
-              ctx.fillText(`⚠ 偵測到 ${poseCount} 人`, canvas.width - 190, hudH * 0.65);
+              setMultiPerson(true);
+              if (!multiPersonTimer.current) {
+                multiPersonTimer.current = setTimeout(() => {
+                  if (voiceOnRef.current) announceMultiplePeople();
+                  multiPersonTimer.current = null;
+                }, 1800);
+              }
+            } else {
+              setMultiPerson(false);
+              if (multiPersonTimer.current) {
+                clearTimeout(multiPersonTimer.current);
+                multiPersonTimer.current = null;
+              }
             }
-          }
 
-          // Draw multi-person skeletons (dimmed)
-          if (poseCount > 1) {
-            for (let pi = 1; pi < poseCount; pi++) {
-              const otherRaw = res.landmarks[pi] as Point3D[];
-              const otherMirrored = isLocal ? otherRaw.map((p) => ({ ...p, x: 1 - p.x })) : otherRaw;
-              ctx.globalAlpha = 0.3;
-              drawSkeleton(ctx, otherMirrored, canvas.width, canvas.height, 30);
-              ctx.globalAlpha = 1;
-            }
-          }
-        } else {
-          setPersonDetected(false);
-          if (trackRef.current) {
-            setStatus("paused");
-            if (!personLostTimer.current) {
-              personLostTimer.current = setTimeout(() => {
-                if (voiceOn) announcePersonLost();
+            if (primary) {
+              const wasMissing = !personWasDetectedRef.current;
+              personWasDetectedRef.current = true;
+              setPersonDetected(true);
+              primaryCenterRef.current = poseCenter(primary);
+              if (personLostTimer.current) {
+                clearTimeout(personLostTimer.current);
                 personLostTimer.current = null;
-              }, 2000);
+              }
+
+              const mirrored = isLocal ? primary.map((point) => ({ ...point, x: 1 - point.x })) : primary;
+              drawSkeleton(ctx, mirrored, canvas.width, canvas.height, stateRef.current.quality);
+
+              const usable = coverage >= 0.5;
+              if (trackRef.current && usable) {
+                if (wasMissing && statusRef.current === "paused" && voiceOnRef.current) announcePersonFound();
+                if (statusRef.current !== "detecting") setStatus("detecting");
+                const current = stateRef.current;
+                const next = detectExercise(exRef.current, primary, { ...current });
+                const changed =
+                  next.reps !== current.reps || next.phase !== current.phase ||
+                  next.duration !== current.duration || next.quality !== current.quality ||
+                  next.pendingRepQuality !== current.pendingRepQuality ||
+                  next.feedback.length !== current.feedback.length;
+                stateRef.current = next;
+                if (changed) setExerciseState(next);
+              } else if (trackRef.current && !usable) {
+                setStatus("paused");
+              }
+
+              if (trackRef.current) {
+                const hudHeight = Math.max(32, Math.round(canvas.height / 14));
+                ctx.fillStyle = "rgba(0,0,0,.58)";
+                ctx.fillRect(0, 0, Math.min(canvas.width, 360), hudHeight);
+                ctx.font = `bold ${Math.max(14, Math.round(canvas.width / 55))}px system-ui, sans-serif`;
+                ctx.fillStyle = usable ? "#00ff88" : "#facc15";
+                ctx.fillText(usable ? `動作：${stateRef.current.phase}` : "請讓完整身體進入畫面", 10, hudHeight * 0.68);
+              }
+
+              for (const pose of poses) {
+                if (pose === primary) continue;
+                const secondary = isLocal ? pose.map((point) => ({ ...point, x: 1 - point.x })) : pose;
+                ctx.globalAlpha = 0.25;
+                drawSkeleton(ctx, secondary, canvas.width, canvas.height, 30);
+                ctx.globalAlpha = 1;
+              }
+            } else {
+              personWasDetectedRef.current = false;
+              primaryCenterRef.current = null;
+              setPersonDetected(false);
+              if (trackRef.current) {
+                setStatus("paused");
+                if (!personLostTimer.current) {
+                  personLostTimer.current = setTimeout(() => {
+                    if (voiceOnRef.current) announcePersonLost();
+                    personLostTimer.current = null;
+                  }, 1600);
+                }
+              }
             }
+          } catch {
+            // Keep displaying the live video if one inference frame fails.
           }
         }
-      } catch {
-        const isLocal = cameras.find((c) => c.id === activeCameraId)?.type !== "remote";
-        ctx.save();
-        if (isLocal) { ctx.scale(-1, 1); ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height); }
-        else { ctx.drawImage(video, 0, 0, canvas.width, canvas.height); }
-        ctx.restore();
+      } else if (lastResultRef.current?.landmarks?.length) {
+        const cached = selectPrimaryPose(lastResultRef.current.landmarks as Point3D[][], primaryCenterRef.current);
+        if (cached) {
+          const displayPose = isLocal ? cached.map((point) => ({ ...point, x: 1 - point.x })) : cached;
+          drawSkeleton(ctx, displayPose, canvas.width, canvas.height, stateRef.current.quality);
+        }
       }
     }
+
     animRef.current = requestAnimationFrame(loop);
-  }, [status, cameras, activeCameraId, voiceOn]);
+  }, []);
 
   /* ---- lifecycle ---- */
   useEffect(() => {
-    initCamera().then(() => initPose());
+    void initCamera().then(() => initPose());
     return () => {
       cancelAnimationFrame(animRef.current);
-      if (videoRef.current?.srcObject) (videoRef.current.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+      camerasRef.current.forEach((camera) => camera.stream?.getTracks().forEach((track) => track.stop()));
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -420,118 +623,194 @@ export default function WorkoutApp() {
 
   /* ---- switch local camera ---- */
   const switchLocalCamera = useCallback(async () => {
-    if (videoRef.current?.srcObject) (videoRef.current.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
-    const cur = cameras.find((c) => c.id === "local-default");
-    const newFacing = cur ? "environment" : "user";
-    await initCamera(newFacing as "user" | "environment");
-  }, [cameras, initCamera]);
+    const currentLocal = camerasRef.current.find((camera) => camera.id === "local-default");
+    currentLocal?.stream?.getTracks().forEach((track) => track.stop());
+    const nextFacing = localFacing === "user" ? "environment" : "user";
+    const stream = await initCamera(nextFacing);
+    if (stream) {
+      setActiveCameraId("local-default");
+      lastTimeRef.current = -1;
+    }
+  }, [initCamera, localFacing]);
 
   /* ---- Remote camera WebRTC ---- */
-  const generateRoom = useCallback(() => {
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    setRoomCode(code);
-    setShowRemoteSetup(true);
-    // Clean old signals
-    fetch(`/api/signal?roomId=${code}`, { method: "DELETE" }).catch(() => {});
-  }, []);
+  const startRemoteHost = useCallback(async (code: string) => {
+    remoteStoppedRef.current = true;
+    remotePcRef.current?.close();
+    remotePendingCandidatesRef.current = [];
+    remoteLastIdRef.current = 0;
+    remoteStoppedRef.current = false;
+    setRemoteConnected(false);
+    setRemoteError("");
+    setRemoteStatus("preparing");
 
-  const connectRemoteCamera = useCallback(() => {
-    if (!roomCode) return;
-
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }],
-    });
+    const pc = new RTCPeerConnection(WEBRTC_CONFIG);
     remotePcRef.current = pc;
 
-    pc.ontrack = (ev) => {
-      if (ev.streams[0]) {
-        // Create hidden video for remote stream
-        let rv = remoteVideoRef.current;
-        if (!rv) {
-          rv = document.createElement("video");
-          rv.playsInline = true;
-          rv.muted = true;
-          rv.autoplay = true;
-          rv.style.display = "none";
-          document.body.appendChild(rv);
-          remoteVideoRef.current = rv;
-        }
-        rv.srcObject = ev.streams[0];
-        rv.play().catch(() => {});
+    pc.ontrack = (event) => {
+      const stream = event.streams[0];
+      if (!stream) return;
 
-        setRemoteConnected(true);
-        setCameras((prev) => {
-          const without = prev.filter((c) => c.id !== `remote-${roomCode}`);
-          return [...without, { id: `remote-${roomCode}`, label: `遠端 ${roomCode}`, type: "remote", status: "active", stream: ev.streams[0], personCount: 0 }];
-        });
+      try {
+        const receiver = event.receiver as RTCRtpReceiver & {
+          playoutDelayHint?: number;
+          jitterBufferTarget?: number;
+        };
+        receiver.playoutDelayHint = 0;
+        receiver.jitterBufferTarget = 0;
+      } catch { /* experimental low-latency hints are optional */ }
+
+      let remoteVideo = remoteVideoRef.current;
+      if (!remoteVideo) {
+        remoteVideo = document.createElement("video");
+        remoteVideo.playsInline = true;
+        remoteVideo.muted = true;
+        remoteVideo.autoplay = true;
+        remoteVideo.style.display = "none";
+        document.body.appendChild(remoteVideo);
+        remoteVideoRef.current = remoteVideo;
       }
+      remoteVideo.srcObject = stream;
+      void remoteVideo.play();
+
+      setCameras((previous) => {
+        const withoutCurrent = previous.filter((camera) => camera.id !== `remote-${code}`);
+        return [
+          ...withoutCurrent,
+          { id: `remote-${code}`, label: `手機鏡頭 ${code}`, type: "remote", status: "active", stream, personCount: 0 },
+        ];
+      });
     };
 
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        fetch("/api/signal", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ roomId: roomCode, sender: "host", msgType: "candidate", data: JSON.stringify(ev.candidate.toJSON()) }),
-        }).catch(() => {});
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        void postSignal(code, "host", "candidate", event.candidate.toJSON());
       }
     };
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "connected") {
         setRemoteConnected(true);
-        if (voiceOn) speak("遠端攝影機已連線");
+        setRemoteStatus("connected");
+        setRemoteError("");
+        if (voiceOnRef.current) speak("遠端手機鏡頭已連線，可以在鏡頭清單中切換", "high", "remote-connected", 0);
+      } else if (pc.connectionState === "connecting") {
+        setRemoteStatus("negotiating");
+      } else if (pc.connectionState === "failed") {
+        setRemoteConnected(false);
+        setRemoteStatus("failed");
+        setRemoteError("目前網路可能限制點對點連線，正在要求手機重新建立連線");
+        void postSignal(code, "host", "restart", { at: Date.now() });
+      } else if (pc.connectionState === "disconnected") {
+        setRemoteStatus("negotiating");
       }
     };
 
-    // Poll for offer from camera
-    remoteLastIdRef.current = 0;
-    remotePollRef.current = setInterval(async () => {
-      try {
-        const r = await fetch(`/api/signal?roomId=${roomCode}&notFrom=host&afterId=${remoteLastIdRef.current}`);
-        const data = await r.json();
-        if (!data.messages) return;
+    setRemoteStatus("waiting");
 
-        for (const msg of [...data.messages].reverse()) {
-          if (msg.id > remoteLastIdRef.current) remoteLastIdRef.current = msg.id;
-          const payload = JSON.parse(msg.data);
+    while (!remoteStoppedRef.current && remotePcRef.current === pc) {
+      const messages = await getSignals(code, "host", remoteLastIdRef.current);
 
-          if (msg.msgType === "offer") {
-            await pc.setRemoteDescription(new RTCSessionDescription(payload));
+      for (const message of messages) {
+        remoteLastIdRef.current = Math.max(remoteLastIdRef.current, message.id);
+
+        if (message.msgType === "ready") {
+          setRemoteStatus("negotiating");
+        } else if (message.msgType === "offer") {
+          const offer = parseSignal<RTCSessionDescriptionInit>(message);
+          if (!offer) continue;
+          try {
+            setRemoteStatus("negotiating");
+            await pc.setRemoteDescription(offer);
+            const queued = remotePendingCandidatesRef.current.splice(0);
+            for (const candidate of queued) {
+              try { await pc.addIceCandidate(candidate); } catch { /* ignore stale candidate */ }
+            }
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
-            await fetch("/api/signal", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ roomId: roomCode, sender: "host", msgType: "answer", data: JSON.stringify({ sdp: answer.sdp, type: answer.type }) }),
-            });
-          } else if (msg.msgType === "candidate" && pc.remoteDescription) {
-            try { await pc.addIceCandidate(new RTCIceCandidate(payload)); } catch { /* skip */ }
+            await postSignal(code, "host", "answer", { type: answer.type, sdp: answer.sdp });
+          } catch {
+            setRemoteStatus("failed");
+            setRemoteError("交換連線資訊失敗，請按重新等待後再試");
           }
+        } else if (message.msgType === "candidate") {
+          const candidate = parseSignal<RTCIceCandidateInit>(message);
+          if (!candidate) continue;
+          if (pc.remoteDescription) {
+            try { await pc.addIceCandidate(candidate); } catch { /* ignore stale candidate */ }
+          } else {
+            remotePendingCandidatesRef.current.push(candidate);
+          }
+        } else if (message.msgType === "bye" && pc.connectionState !== "connected") {
+          setRemoteStatus("waiting");
         }
-      } catch { /* skip */ }
-    }, 800);
-  }, [roomCode, voiceOn]);
-
-  const switchToCamera = useCallback((camId: string) => {
-    setActiveCameraId(camId);
-    lastTimeRef.current = -1;
-
-    if (camId === "local-default") {
-      const local = cameras.find((c) => c.id === "local-default");
-      if (local?.stream && videoRef.current) {
-        videoRef.current.srcObject = local.stream;
-        videoRef.current.play().catch(() => {});
       }
-    } else {
-      // Switch to remote camera video
-      const rv = remoteVideoRef.current;
-      if (rv && videoRef.current) {
-        videoRef.current.srcObject = rv.srcObject;
-        videoRef.current.play().catch(() => {});
-      }
+
+      await wait(pc.connectionState === "connected" ? 1000 : 300);
     }
-  }, [cameras]);
+  }, []);
+
+  const generateRoom = useCallback(async () => {
+    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    setRoomCode(code);
+    setShowRemoteSetup(true);
+    setRemoteStatus("preparing");
+    await clearSignalRoom(code);
+    // Waiting begins automatically; there is no second button to forget.
+    void startRemoteHost(code);
+  }, [startRemoteHost]);
+
+  const retryRemote = useCallback(() => {
+    if (!roomCode) return;
+    remoteStoppedRef.current = true;
+    remotePcRef.current?.close();
+    window.setTimeout(() => void startRemoteHost(roomCode), 250);
+  }, [roomCode, startRemoteHost]);
+
+  const cancelRemoteSetup = useCallback(() => {
+    remoteStoppedRef.current = true;
+    remotePcRef.current?.close();
+    if (roomCode) void postSignal(roomCode, "host", "bye", { at: Date.now() });
+    setShowRemoteSetup(false);
+    setRemoteStatus("idle");
+    setRoomCode("");
+  }, [roomCode]);
+
+  const shareRemoteLink = useCallback(async () => {
+    if (!roomCode) return;
+    const url = `${window.location.origin}/camera/${roomCode}`;
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: "AI 遠端攝影機", text: `房間代碼：${roomCode}`, url });
+      } else {
+        await navigator.clipboard.writeText(url);
+        setLinkCopied(true);
+        window.setTimeout(() => setLinkCopied(false), 1800);
+      }
+    } catch {
+      try {
+        await navigator.clipboard.writeText(url);
+        setLinkCopied(true);
+        window.setTimeout(() => setLinkCopied(false), 1800);
+      } catch { /* clipboard may be blocked */ }
+    }
+  }, [roomCode]);
+
+  const switchToCamera = useCallback((cameraId: string) => {
+    const camera = camerasRef.current.find((item) => item.id === cameraId);
+    if (!camera?.stream || !videoRef.current) return;
+
+    setActiveCameraId(cameraId);
+    activeCameraRef.current = cameraId;
+    videoRef.current.srcObject = camera.stream;
+    void videoRef.current.play();
+    lastTimeRef.current = -1;
+    lastInferenceAtRef.current = 0;
+    lastResultRef.current = null;
+    lastDimensionsRef.current = { width: 0, height: 0 };
+    primaryCenterRef.current = null;
+    setPersonDetected(false);
+  }, []);
 
   /* ---- exercise handlers ---- */
   const selectExercise = useCallback((type: ExerciseType) => {
@@ -540,31 +819,48 @@ export default function WorkoutApp() {
       setTotalSessionReps((p) => p + exerciseState.reps);
     }
     resetDetectorState();
+    const freshState = createExerciseState(type);
+    stateRef.current = freshState;
     setSelectedExercise(type);
-    setExerciseState(createExerciseState(type));
+    setExerciseState(freshState);
     setShowMenu(false);
     setChallengeCompleted(false);
     prevReps.current = 0;
     prevFeedbackLen.current = 0;
   }, [exerciseState]);
 
+  const resetCurrentExercise = useCallback(() => {
+    resetDetectorState();
+    const freshState = createExerciseState(selectedExercise);
+    stateRef.current = freshState;
+    setExerciseState(freshState);
+    setChallengeCompleted(false);
+    prevReps.current = 0;
+    prevFeedbackLen.current = 0;
+  }, [selectedExercise]);
+
   const toggleTrack = useCallback(() => {
     if (isTracking) {
       setIsTracking(false);
       setStatus("ready");
-      if (voiceOn) announceExerciseStop();
+      if (voiceOn) announceExerciseStop(exerciseState.reps);
     } else {
+      if (voiceOn) unlockVoice();
       resetDetectorState();
-      setExerciseState(createExerciseState(selectedExercise));
+      const freshState = createExerciseState(selectedExercise);
+      stateRef.current = freshState;
+      setExerciseState(freshState);
       setIsTracking(true);
-      setStatus("detecting");
+      setStatus(personDetected && poseCoverage >= 50 ? "detecting" : "paused");
       setChallengeCompleted(false);
       prevReps.current = 0;
       prevFeedbackLen.current = 0;
-      const info = EXERCISES.find((e) => e.id === selectedExercise);
-      if (voiceOn && info) announceExerciseStart(info.nameZh);
+      const exercise = EXERCISES.find((item) => item.id === selectedExercise);
+      if (voiceOn && exercise) {
+        window.setTimeout(() => announceExerciseStart(exercise.nameZh), 250);
+      }
     }
-  }, [isTracking, selectedExercise, voiceOn]);
+  }, [isTracking, selectedExercise, voiceOn, exerciseState.reps, personDetected, poseCoverage]);
 
   useEffect(() => {
     if (challengeMode && !challengeCompleted && exerciseState.reps >= challengeTarget) {
@@ -592,16 +888,15 @@ export default function WorkoutApp() {
     const next = !voiceOn;
     setVoiceOn(next);
     setVoiceEnabled(next);
-    if (next) speak("語音播報已開啟");
+    if (next) unlockVoice();
   }, [voiceOn]);
 
   /* cleanup remote on unmount */
   useEffect(() => {
     return () => {
-      if (remotePollRef.current) clearInterval(remotePollRef.current);
+      remoteStoppedRef.current = true;
       remotePcRef.current?.close();
       if (remoteVideoRef.current) {
-        if (remoteVideoRef.current.srcObject) (remoteVideoRef.current.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
         remoteVideoRef.current.remove();
       }
     };
@@ -609,6 +904,8 @@ export default function WorkoutApp() {
 
   const info = EXERCISES.find((e) => e.id === selectedExercise)!;
   const baseUrl = typeof window !== "undefined" ? window.location.origin : "";
+  const cameraAspect = videoDimensions.width / Math.max(1, videoDimensions.height);
+  const qualityLabel = cameraQuality === "clear" ? "清晰" : cameraQuality === "fair" ? "普通" : "模糊";
 
   /* ================================================================ */
   /*  RENDER                                                          */
@@ -618,10 +915,10 @@ export default function WorkoutApp() {
       {/* ---- HEADER ---- */}
       <header className="bg-black/50 backdrop-blur-md border-b border-white/10 px-3 py-2 sm:px-4 sm:py-3 flex-shrink-0 z-30">
         <div className="max-w-7xl mx-auto flex items-center justify-between gap-2">
-          <a href="/" className="flex items-center gap-1.5 hover:opacity-80 transition flex-shrink-0">
+          <Link href="/" className="flex items-center gap-1.5 hover:opacity-80 transition flex-shrink-0">
             <span className="text-xl sm:text-2xl">🏋️‍♂️</span>
             <span className="text-sm sm:text-lg font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent hidden xs:inline">AI 運動教練</span>
-          </a>
+          </Link>
           <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap justify-end">
             <StatusBadge status={status} />
             <button onClick={toggleVoice} className={`p-1.5 sm:p-2 rounded-lg transition text-xs sm:text-sm ${voiceOn ? "bg-cyan-500/20 text-cyan-300" : "bg-white/10 text-gray-400"}`} title="語音播報">
@@ -631,7 +928,7 @@ export default function WorkoutApp() {
               📹 <span className="hidden sm:inline text-[10px] text-gray-400">{cameras.length}</span>
             </button>
             <button onClick={switchLocalCamera} className="p-1.5 sm:p-2 rounded-lg bg-white/10 hover:bg-white/20 transition text-xs sm:text-sm" title="切換鏡頭">📷</button>
-            <a href="/history" className="px-2 py-1.5 sm:px-3 rounded-lg bg-white/10 hover:bg-white/20 transition text-xs sm:text-sm">📊<span className="hidden sm:inline ml-1">紀錄</span></a>
+            <Link href="/history" className="px-2 py-1.5 sm:px-3 rounded-lg bg-white/10 hover:bg-white/20 transition text-xs sm:text-sm">📊<span className="hidden sm:inline ml-1">紀錄</span></Link>
           </div>
         </div>
       </header>
@@ -651,18 +948,36 @@ export default function WorkoutApp() {
 
           {/* ====== LEFT: CAMERA ====== */}
           <div className={`lg:col-span-2 ${mobileTab !== "cam" ? "hidden sm:block" : ""}`}>
-            <div className="relative rounded-xl sm:rounded-2xl overflow-hidden bg-black shadow-2xl shadow-cyan-500/10 border border-white/10">
+            <div
+              className="relative mx-auto max-h-[68dvh] overflow-hidden rounded-xl border border-white/10 bg-black shadow-2xl shadow-cyan-500/10 sm:rounded-2xl"
+              style={{
+                aspectRatio: `${videoDimensions.width} / ${videoDimensions.height}`,
+                width: cameraAspect < 1 ? `min(100%, ${Math.round(68 * cameraAspect)}dvh)` : "100%",
+              }}
+            >
               <video ref={videoRef} className="hidden" playsInline muted />
-              <canvas ref={canvasRef} className="w-full aspect-video bg-gray-900" />
+              <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-gray-900" />
 
               {/* person-lost overlay */}
               {!personDetected && isTracking && (
-                <div className="absolute inset-0 bg-black/60 flex items-center justify-center backdrop-blur-sm">
-                  <div className="text-center p-4">
-                    <span className="text-4xl sm:text-5xl mb-3 block">👤</span>
-                    <p className="text-base sm:text-lg font-semibold text-yellow-400">未偵測到人物</p>
-                    <p className="text-xs sm:text-sm text-gray-300 mt-1">請確保全身在鏡頭範圍內</p>
+                <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                  <div className="p-4 text-center">
+                    <span className="mb-3 block text-4xl sm:text-5xl">👤</span>
+                    <p className="text-base font-semibold text-yellow-400 sm:text-lg">未偵測到人物</p>
+                    <p className="mt-1 text-xs text-gray-300 sm:text-sm">請確保頭、手與腳都在鏡頭範圍內</p>
                   </div>
+                </div>
+              )}
+
+              {personDetected && isTracking && poseCoverage < 50 && (
+                <div className="absolute bottom-12 left-1/2 z-10 -translate-x-1/2 whitespace-nowrap rounded-lg bg-yellow-500/90 px-3 py-1.5 text-[10px] font-bold text-black sm:text-xs">
+                  ⚠️ 身體只有 {poseCoverage}% 可見，請退後一點
+                </div>
+              )}
+
+              {cameraQuality === "blurred" && (
+                <div className="absolute left-2 top-11 z-10 rounded-lg bg-orange-600/90 px-3 py-1.5 text-[10px] font-bold sm:left-3 sm:text-xs">
+                  🧽 畫面模糊：擦拭鏡頭並增加光線
                 </div>
               )}
 
@@ -682,10 +997,12 @@ export default function WorkoutApp() {
               )}
 
               {/* camera label */}
-              <div className="absolute bottom-2 left-2 sm:bottom-3 sm:left-3 bg-black/50 backdrop-blur rounded-lg px-2 py-1 text-[10px] sm:text-xs text-gray-300 flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                {cameras.find((c) => c.id === activeCameraId)?.label || "本機鏡頭"}
-                {cameras.length > 1 && <span className="text-gray-500">({cameras.length}台)</span>}
+              <div className="absolute bottom-2 left-2 flex items-center gap-1.5 rounded-lg bg-black/65 px-2 py-1 text-[9px] text-gray-200 backdrop-blur sm:bottom-3 sm:left-3 sm:text-xs">
+                <span className={`h-1.5 w-1.5 rounded-full ${cameraQuality === "blurred" ? "bg-orange-400" : "bg-green-400 animate-pulse"}`} />
+                <span>{cameras.find((camera) => camera.id === activeCameraId)?.label || "本機鏡頭"}</span>
+                <span className="text-gray-400">{videoDimensions.width}×{videoDimensions.height}</span>
+                <span className={cameraQuality === "clear" ? "text-green-300" : cameraQuality === "fair" ? "text-yellow-300" : "text-orange-300"}>{qualityLabel}</span>
+                <span className="text-cyan-300">AI {inferenceMs || "—"}ms</span>
               </div>
 
               {/* idle overlay */}
@@ -704,8 +1021,8 @@ export default function WorkoutApp() {
               <button onClick={toggleTrack} className={`px-4 py-2 sm:px-6 sm:py-2.5 rounded-xl font-bold transition shadow-lg text-xs sm:text-sm ${isTracking ? "bg-red-500 hover:bg-red-600 shadow-red-500/20" : "bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-600 hover:to-blue-700 shadow-cyan-500/20"}`}>
                 {isTracking ? "⏹ 停止" : "▶️ 開始追蹤"}
               </button>
-              <button onClick={() => { resetDetectorState(); setExerciseState(createExerciseState(selectedExercise)); setChallengeCompleted(false); prevReps.current = 0; prevFeedbackLen.current = 0; }}
-                className="px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl bg-white/10 hover:bg-white/20 transition text-xs sm:text-sm">🔄</button>
+              <button onClick={resetCurrentExercise}
+                className="px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl bg-white/10 hover:bg-white/20 transition text-xs sm:text-sm" title="重置目前運動">🔄</button>
               <button onClick={saveSession} className="px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 transition font-medium shadow-lg shadow-emerald-500/20 text-xs sm:text-sm">💾 儲存</button>
             </div>
 
@@ -807,31 +1124,51 @@ export default function WorkoutApp() {
                 <p className="text-[10px] text-gray-500 mb-2">將另一台手機作為 AI 攝影機，從不同角度捕捉動作</p>
 
                 {!showRemoteSetup ? (
-                  <button onClick={generateRoom} className="w-full py-2 rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 transition font-medium text-xs">
-                    📱 產生連線代碼
+                  <button onClick={() => void generateRoom()} className="w-full rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 py-2 text-xs font-medium transition hover:from-purple-700 hover:to-pink-700">
+                    📱 產生連線代碼並自動等待
                   </button>
                 ) : (
                   <div className="space-y-2">
-                    <div className="bg-black/40 rounded-lg p-3 text-center">
-                      <p className="text-[10px] text-gray-400 mb-1">房間代碼</p>
-                      <p className="text-2xl sm:text-3xl font-black text-cyan-400 tracking-widest">{roomCode}</p>
+                    <div className="rounded-lg bg-black/40 p-3 text-center">
+                      <p className="mb-1 text-[10px] text-gray-400">在另一台手機輸入房間代碼</p>
+                      <p className="text-2xl font-black tracking-widest text-cyan-400 sm:text-3xl">{roomCode}</p>
                     </div>
-                    <div className="bg-black/40 rounded-lg p-2 text-center">
-                      <p className="text-[10px] text-gray-400 mb-1">或在手機瀏覽器開啟：</p>
-                      <p className="text-[10px] sm:text-xs text-cyan-300 break-all select-all">{baseUrl}/camera/{roomCode}</p>
+
+                    <div className={`rounded-lg border p-2.5 text-center ${
+                      remoteStatus === "connected" ? "border-green-500/30 bg-green-500/10" :
+                      remoteStatus === "failed" ? "border-red-500/30 bg-red-500/10" :
+                      "border-cyan-500/20 bg-cyan-500/10"
+                    }`}>
+                      <p className={`text-xs font-bold ${remoteStatus === "connected" ? "text-green-300" : remoteStatus === "failed" ? "text-red-300" : "text-cyan-300"}`}>
+                        {remoteStatus === "preparing" && "⏳ 正在準備連線房間"}
+                        {remoteStatus === "waiting" && "📡 已自動等待手機連線"}
+                        {remoteStatus === "negotiating" && "🔗 找到手機，正在建立低延遲連線"}
+                        {remoteStatus === "connected" && "✅ 遠端手機鏡頭已連線"}
+                        {remoteStatus === "failed" && "❌ 連線失敗"}
+                      </p>
+                      {remoteError && <p className="mt-1 text-[10px] text-gray-300">{remoteError}</p>}
                     </div>
-                    {!remoteConnected ? (
-                      <button onClick={connectRemoteCamera} className="w-full py-2 rounded-lg bg-cyan-600 hover:bg-cyan-700 transition font-medium text-xs">
-                        🔗 開始等待連線
+
+                    <div className="rounded-lg bg-black/40 p-2 text-center">
+                      <p className="mb-1 text-[10px] text-gray-400">手機可開啟以下網址，或前往 /camera 輸入代碼</p>
+                      <p className="select-all break-all text-[10px] text-cyan-300 sm:text-xs">{baseUrl}/camera/{roomCode}</p>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <button onClick={() => void shareRemoteLink()} className="rounded-lg bg-white/10 py-2 text-xs font-medium hover:bg-white/15">
+                        {linkCopied ? "✅ 已複製" : "📤 分享 / 複製"}
                       </button>
-                    ) : (
-                      <div className="text-center py-1">
-                        <span className="text-xs text-green-400 font-bold">✅ 遠端攝影機已連線！</span>
-                      </div>
-                    )}
-                    <button onClick={() => { setShowRemoteSetup(false); setRoomCode(""); }} className="w-full py-1.5 rounded-lg bg-white/5 hover:bg-white/10 transition text-xs text-gray-400">
-                      取消
-                    </button>
+                      {remoteConnected ? (
+                        <button onClick={() => switchToCamera(`remote-${roomCode}`)} className="rounded-lg bg-green-600 py-2 text-xs font-bold hover:bg-green-700">切換到手機畫面</button>
+                      ) : (
+                        <button onClick={retryRemote} className="rounded-lg bg-cyan-600 py-2 text-xs font-medium hover:bg-cyan-700">🔄 重新等待</button>
+                      )}
+                    </div>
+
+                    <Link href="/camera" target="_blank" rel="noreferrer" className="block rounded-lg bg-white/5 py-1.5 text-center text-[10px] text-gray-400 hover:bg-white/10 hover:text-white">
+                      在此裝置預覽手機代碼輸入頁 ↗
+                    </Link>
+                    <button onClick={cancelRemoteSetup} className="w-full rounded-lg bg-white/5 py-1.5 text-xs text-gray-400 transition hover:bg-white/10">取消連線房間</button>
                   </div>
                 )}
               </div>

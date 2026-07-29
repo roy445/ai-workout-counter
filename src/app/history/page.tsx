@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { EXERCISES } from "@/lib/exercise-detector";
 
 interface ExerciseRecord { id: number; exerciseType: string; reps: number; duration: number; avgQuality: number; }
@@ -49,11 +50,11 @@ export default function HistoryPage() {
     <div className="min-h-[100dvh] bg-gradient-to-br from-gray-950 via-gray-900 to-gray-950 text-white">
       <header className="bg-black/40 backdrop-blur-md border-b border-white/10 px-3 sm:px-4 py-2 sm:py-3">
         <div className="max-w-5xl mx-auto flex items-center justify-between">
-          <a href="/" className="flex items-center gap-2 hover:opacity-80 transition">
+          <Link href="/" className="flex items-center gap-2 hover:opacity-80 transition">
             <span className="text-xl sm:text-2xl">🏋️‍♂️</span>
             <span className="text-sm sm:text-lg font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">AI 運動教練</span>
-          </a>
-          <a href="/workout" className="px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 font-medium text-xs sm:text-sm">🎯 開始運動</a>
+          </Link>
+          <Link href="/workout" className="px-3 py-1.5 sm:px-4 sm:py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 font-medium text-xs sm:text-sm">🎯 開始運動</Link>
         </div>
       </header>
 
@@ -101,7 +102,7 @@ export default function HistoryPage() {
                   <div className="text-center py-12 sm:py-16 bg-white/5 rounded-2xl border border-white/10">
                     <span className="text-4xl sm:text-5xl mb-3 block">🏃‍♂️</span>
                     <p className="text-base sm:text-lg font-semibold text-gray-300">還沒有訓練紀錄</p>
-                    <a href="/workout" className="inline-block mt-3 px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 font-medium text-xs sm:text-sm">開始運動</a>
+                    <Link href="/workout" className="inline-block mt-3 px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 font-medium text-xs sm:text-sm">開始運動</Link>
                   </div>
                 ) : sessions.map((s) => (
                   <div key={s.id} className="bg-white/5 backdrop-blur rounded-xl sm:rounded-2xl p-3 sm:p-5 border border-white/10">

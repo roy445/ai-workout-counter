@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { EXERCISES } from "@/lib/exercise-detector";
 
 export default function Home() {
@@ -14,9 +15,10 @@ export default function Home() {
             <span className="text-2xl sm:text-3xl">🏋️‍♂️</span>
             <span className="text-lg sm:text-xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">AI Fitness Coach</span>
           </div>
-          <div className="flex items-center gap-2 sm:gap-3">
-            <a href="/history" className="px-3 py-2 rounded-xl text-xs sm:text-sm text-gray-300 hover:text-white hover:bg-white/10 transition">📊 紀錄</a>
-            <a href="/workout" className="px-4 py-2 sm:px-5 sm:py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 font-bold text-xs sm:text-sm hover:from-cyan-600 hover:to-blue-700 transition shadow-lg shadow-cyan-500/20">開始運動 →</a>
+          <div className="flex items-center gap-1 sm:gap-3">
+            <Link href="/camera" className="rounded-xl px-2 py-2 text-xs text-gray-300 transition hover:bg-white/10 hover:text-white sm:px-3 sm:text-sm">📱 <span className="hidden sm:inline">手機鏡頭</span></Link>
+            <Link href="/history" className="hidden rounded-xl px-3 py-2 text-xs text-gray-300 transition hover:bg-white/10 hover:text-white sm:inline-block sm:text-sm">📊 紀錄</Link>
+            <Link href="/workout" className="rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 px-3 py-2 text-xs font-bold shadow-lg shadow-cyan-500/20 transition hover:from-cyan-600 hover:to-blue-700 sm:px-5 sm:py-2.5 sm:text-sm">開始運動 →</Link>
           </div>
         </header>
 
@@ -31,12 +33,12 @@ export default function Home() {
             只需一個普通鏡頭，AI 即時辨識人體姿勢，智慧計數與品質評分。支援語音報數、姿勢糾正播報，還能連接手機作為多角度攝影機。
           </p>
           <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4">
-            <a href="/workout" className="group w-full sm:w-auto px-6 py-3 sm:px-8 sm:py-4 rounded-2xl bg-gradient-to-r from-cyan-500 to-blue-600 font-bold text-base sm:text-lg hover:from-cyan-600 hover:to-blue-700 transition shadow-2xl shadow-cyan-500/30 flex items-center justify-center gap-2">
+            <Link href="/workout" className="group w-full sm:w-auto px-6 py-3 sm:px-8 sm:py-4 rounded-2xl bg-gradient-to-r from-cyan-500 to-blue-600 font-bold text-base sm:text-lg hover:from-cyan-600 hover:to-blue-700 transition shadow-2xl shadow-cyan-500/30 flex items-center justify-center gap-2">
               <span>立即開始運動</span><span className="group-hover:translate-x-1 transition-transform">→</span>
-            </a>
-            <a href="/history" className="w-full sm:w-auto px-6 py-3 sm:px-8 sm:py-4 rounded-2xl bg-white/5 border border-white/10 font-medium text-base sm:text-lg hover:bg-white/10 transition text-center">
+            </Link>
+            <Link href="/history" className="w-full sm:w-auto px-6 py-3 sm:px-8 sm:py-4 rounded-2xl bg-white/5 border border-white/10 font-medium text-base sm:text-lg hover:bg-white/10 transition text-center">
               查看紀錄 📊
-            </a>
+            </Link>
           </div>
         </div>
       </div>
@@ -111,7 +113,7 @@ export default function Home() {
         <div className="bg-gradient-to-r from-cyan-500/10 via-blue-600/10 to-purple-500/10 rounded-2xl sm:rounded-3xl p-8 sm:p-12 border border-white/10 text-center">
           <h2 className="text-2xl sm:text-3xl font-bold mb-3 sm:mb-4">準備好成為更好的自己了嗎？</h2>
           <p className="text-sm sm:text-base text-gray-400 mb-6 sm:mb-8 max-w-lg mx-auto">不需要穿戴設備，不需要健身房，只需要鏡頭和你的決心。</p>
-          <a href="/workout" className="inline-block px-8 py-3 sm:px-10 sm:py-4 rounded-2xl bg-gradient-to-r from-cyan-500 to-blue-600 font-bold text-base sm:text-lg hover:from-cyan-600 hover:to-blue-700 transition shadow-2xl shadow-cyan-500/30">🚀 立即開始訓練</a>
+          <Link href="/workout" className="inline-block px-8 py-3 sm:px-10 sm:py-4 rounded-2xl bg-gradient-to-r from-cyan-500 to-blue-600 font-bold text-base sm:text-lg hover:from-cyan-600 hover:to-blue-700 transition shadow-2xl shadow-cyan-500/30">🚀 立即開始訓練</Link>
         </div>
       </section>
 
