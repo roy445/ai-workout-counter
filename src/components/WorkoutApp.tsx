@@ -738,12 +738,16 @@ export default function WorkoutApp() {
         setRemoteError("");
         if (voiceOnRef.current) {
           speak(
-            "遠端手機鏡頭已連線，可以在鏡頭清單中切換",
+            "遠端手機鏡頭已連線，系統已自動為您切換至手機畫面",
             "high",
             "remote-connected",
             0,
           );
         }
+        // Automatically switch to the newly connected remote mobile camera stream
+        window.setTimeout(() => {
+          switchToCamera(`remote-${code}`);
+        }, 1200);
       } else if (pc.connectionState === "connecting") {
         setRemoteStatus("negotiating");
       } else if (pc.connectionState === "failed") {
@@ -837,6 +841,7 @@ export default function WorkoutApp() {
 
       await wait(pc.connectionState === "connected" ? 1000 : 350);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const generateRoom = useCallback(async () => {
@@ -1047,7 +1052,18 @@ export default function WorkoutApp() {
                 width: cameraAspect < 1 ? `min(100%, ${Math.round(68 * cameraAspect)}dvh)` : "100%",
               }}
             >
-              <video ref={videoRef} className="hidden" playsInline muted />
+              <video
+                ref={videoRef}
+                style={{
+                  position: "absolute",
+                  opacity: 0,
+                  width: "4px",
+                  height: "4px",
+                  pointerEvents: "none",
+                }}
+                playsInline
+                muted
+              />
               <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-gray-900" />
 
               {/* person-lost overlay */}

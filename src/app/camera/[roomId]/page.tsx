@@ -260,6 +260,11 @@ export default function RemoteCameraPage() {
           );
 
           if (message.msgType === "offer") {
+            // Protect established connection: ignore duplicate/belated offers once stable/connected.
+            if (offerReceived || pc.signalingState !== "stable" || pc.connectionState === "connected") {
+              continue;
+            }
+
             const offer = parseSignal<RTCSessionDescriptionInit>(message);
             if (!offer || offer.type !== "offer") continue;
 
