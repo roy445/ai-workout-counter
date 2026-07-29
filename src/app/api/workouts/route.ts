@@ -1,134 +1,129 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { workoutSessions, exerciseRecords, dailyStats } from "@/db/schema";
-import { desc, eq, sql } from "drizzle-orm";
+import { ensureDatabaseSchema } from "@/db/bootstrap";
+import { signaling } from "@/db/schema";
+import { and, asc, eq, gt, ne } from "drizzle-orm";
 
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+const noStoreHeaders = {
+  "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+};
+
+function serverError(error: unknown) {
+  console.error("Signal database error:", error);
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  const code =
+    message.includes("database_url") ||
+    message.includes("connect") ||
+    message.includes("password") ||
+    message.includes("timeout")
+      ? "DATABASE_UNAVAILABLE"
+      : "SIGNALING_DATABASE_ERROR";
+
+  return NextResponse.json(
+    {
+      error: "Signaling service unavailable",
+      code,
+      hint:
+        code === "DATABASE_UNAVAILABLE"
+          ? "Check DATABASE_URL in Vercel."
+          : "The signaling table could not be initialized.",
+    },
+    { status: 503, headers: noStoreHeaders },
+  );
+}
+
+// Store one WebRTC signaling message. The video itself never passes here.
 export async function POST(request: NextRequest) {
   try {
+    await ensureDatabaseSchema();
     const body = await request.json();
-    const { totalDuration, totalReps, avgQuality, exercises } = body;
+    const roomId = String(body.roomId || "").trim().toUpperCase();
+    const sender = String(body.sender || "").trim();
+    const msgType = String(body.msgType || "").trim();
+    const data =
+      typeof body.data === "string" ? body.data : JSON.stringify(body.data);
 
-    // Create workout session
-    const [session] = await db
-      .insert(workoutSessions)
-      .values({
-        totalDuration: totalDuration || 0,
-        totalReps: totalReps || 0,
-        avgQuality: avgQuality || 0,
-        endedAt: new Date(),
-      })
-      .returning();
-
-    // Create exercise records
-    if (exercises && exercises.length > 0) {
-      for (const ex of exercises) {
-        await db.insert(exerciseRecords).values({
-          sessionId: session.id,
-          exerciseType: ex.type,
-          reps: ex.reps || 0,
-          duration: ex.duration || 0,
-          avgQuality: ex.quality || 0,
-          feedbackSummary: ex.feedbackSummary || "",
-        });
-      }
+    if (!/^[A-Z0-9]{4,12}$/.test(roomId) || !sender || !msgType || !data) {
+      return NextResponse.json(
+        { error: "Invalid signaling message" },
+        { status: 400, headers: noStoreHeaders },
+      );
     }
 
-    // Update daily stats
-    const today = new Date().toISOString().split("T")[0];
-    const existingStats = await db
-      .select()
-      .from(dailyStats)
-      .where(eq(dailyStats.dateStr, today))
-      .limit(1);
+    const [message] = await db
+      .insert(signaling)
+      .values({ roomId, sender, msgType, data })
+      .returning({ id: signaling.id });
 
-    if (existingStats.length > 0) {
-      await db
-        .update(dailyStats)
-        .set({
-          totalReps: sql`${dailyStats.totalReps} + ${totalReps || 0}`,
-          totalDuration: sql`${dailyStats.totalDuration} + ${totalDuration || 0}`,
-          exerciseTypes: (existingStats[0].exerciseTypes || "") +
-            "," +
-            (exercises || []).map((e: { type: string }) => e.type).join(","),
-        })
-        .where(eq(dailyStats.dateStr, today));
-    } else {
-      // Calculate streak
-      const yesterday = new Date();
-      yesterday.setDate(yesterday.getDate() - 1);
-      const yesterdayStr = yesterday.toISOString().split("T")[0];
-      const yesterdayStats = await db
-        .select()
-        .from(dailyStats)
-        .where(eq(dailyStats.dateStr, yesterdayStr))
-        .limit(1);
-
-      const streak = yesterdayStats.length > 0 ? (yesterdayStats[0].streakDays || 0) + 1 : 1;
-
-      await db.insert(dailyStats).values({
-        dateStr: today,
-        totalReps: totalReps || 0,
-        totalDuration: totalDuration || 0,
-        exerciseTypes: (exercises || [])
-          .map((e: { type: string }) => e.type)
-          .join(","),
-        streakDays: streak,
-      });
-    }
-
-    return NextResponse.json({ success: true, sessionId: session.id });
-  } catch (error) {
-    console.error("Error saving workout:", error);
     return NextResponse.json(
-      { error: "Failed to save workout" },
-      { status: 500 }
+      { ok: true, id: message.id },
+      { headers: noStoreHeaders },
     );
+  } catch (error) {
+    return serverError(error);
   }
 }
 
-export async function GET() {
+// Poll only messages newer than afterId, in their original creation order.
+export async function GET(request: NextRequest) {
   try {
-    // Get recent sessions with their exercises
-    const sessions = await db
-      .select()
-      .from(workoutSessions)
-      .orderBy(desc(workoutSessions.startedAt))
-      .limit(20);
+    await ensureDatabaseSchema();
+    const { searchParams } = new URL(request.url);
+    const roomId = String(searchParams.get("roomId") || "")
+      .trim()
+      .toUpperCase();
+    const notFrom = String(searchParams.get("notFrom") || "").trim();
+    const afterId = Math.max(
+      0,
+      Number.parseInt(searchParams.get("afterId") || "0", 10) || 0,
+    );
 
-    const sessionIds = sessions.map((s) => s.id);
-
-    let exercises: (typeof exerciseRecords.$inferSelect)[] = [];
-    if (sessionIds.length > 0) {
-      exercises = await db
-        .select()
-        .from(exerciseRecords)
-        .where(
-          sql`${exerciseRecords.sessionId} IN (${sql.join(
-            sessionIds.map((id) => sql`${id}`),
-            sql`, `
-          )})`
-        );
+    if (!/^[A-Z0-9]{4,12}$/.test(roomId)) {
+      return NextResponse.json(
+        { error: "Valid roomId required" },
+        { status: 400, headers: noStoreHeaders },
+      );
     }
 
-    // Get daily stats
-    const stats = await db
-      .select()
-      .from(dailyStats)
-      .orderBy(desc(dailyStats.dateStr))
-      .limit(30);
+    const conditions = [
+      eq(signaling.roomId, roomId),
+      gt(signaling.id, afterId),
+    ];
+    if (notFrom) conditions.push(ne(signaling.sender, notFrom));
 
-    return NextResponse.json({
-      sessions: sessions.map((s) => ({
-        ...s,
-        exercises: exercises.filter((e) => e.sessionId === s.id),
-      })),
-      dailyStats: stats,
-    });
+    const messages = await db
+      .select()
+      .from(signaling)
+      .where(and(...conditions))
+      .orderBy(asc(signaling.id))
+      .limit(100);
+
+    return NextResponse.json({ messages }, { headers: noStoreHeaders });
   } catch (error) {
-    console.error("Error fetching workouts:", error);
-    return NextResponse.json(
-      { error: "Failed to fetch workouts" },
-      { status: 500 }
-    );
+    return serverError(error);
+  }
+}
+
+// The host clears stale messages before creating a fresh room.
+export async function DELETE(request: NextRequest) {
+  try {
+    await ensureDatabaseSchema();
+    const { searchParams } = new URL(request.url);
+    const roomId = String(searchParams.get("roomId") || "")
+      .trim()
+      .toUpperCase();
+    if (!/^[A-Z0-9]{4,12}$/.test(roomId)) {
+      return NextResponse.json(
+        { error: "Valid roomId required" },
+        { status: 400, headers: noStoreHeaders },
+      );
+    }
+    await db.delete(signaling).where(eq(signaling.roomId, roomId));
+    return NextResponse.json({ ok: true }, { headers: noStoreHeaders });
+  } catch (error) {
+    return serverError(error);
   }
 }

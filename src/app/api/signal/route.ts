@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
+import { ensureDatabaseSchema } from "@/db/bootstrap";
 import { signaling } from "@/db/schema";
-import { and, asc, eq, gt, ne, sql } from "drizzle-orm";
+import { and, asc, eq, gt, ne } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -9,38 +10,6 @@ export const revalidate = 0;
 const noStoreHeaders = {
   "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
 };
-
-let schemaReadyPromise: Promise<void> | null = null;
-
-/**
- * Older deployments might have the workout tables but not the newer signaling
- * table. Bootstrap only this ephemeral signaling table on first use so remote
- * cameras work even when a manual Drizzle push was skipped.
- */
-function ensureSignalingSchema(): Promise<void> {
-  if (!schemaReadyPromise) {
-    schemaReadyPromise = (async () => {
-      await db.execute(sql`
-        CREATE TABLE IF NOT EXISTS "signaling" (
-          "id" serial PRIMARY KEY NOT NULL,
-          "room_id" varchar(20) NOT NULL,
-          "sender" varchar(20) NOT NULL,
-          "msg_type" varchar(30) NOT NULL,
-          "data" text NOT NULL,
-          "created_at" timestamp DEFAULT now() NOT NULL
-        )
-      `);
-      await db.execute(sql`
-        CREATE INDEX IF NOT EXISTS "signaling_room_id_id_idx"
-        ON "signaling" ("room_id", "id")
-      `);
-    })().catch((error) => {
-      schemaReadyPromise = null;
-      throw error;
-    });
-  }
-  return schemaReadyPromise;
-}
 
 function serverError(error: unknown) {
   console.error("Signal database error:", error);
@@ -69,7 +38,7 @@ function serverError(error: unknown) {
 // Store one WebRTC signaling message. The video itself never passes here.
 export async function POST(request: NextRequest) {
   try {
-    await ensureSignalingSchema();
+    await ensureDatabaseSchema();
     const body = await request.json();
     const roomId = String(body.roomId || "").trim().toUpperCase();
     const sender = String(body.sender || "").trim();
@@ -101,7 +70,7 @@ export async function POST(request: NextRequest) {
 // Poll only messages newer than afterId, in their original creation order.
 export async function GET(request: NextRequest) {
   try {
-    await ensureSignalingSchema();
+    await ensureDatabaseSchema();
     const { searchParams } = new URL(request.url);
     const roomId = String(searchParams.get("roomId") || "")
       .trim()
@@ -141,7 +110,7 @@ export async function GET(request: NextRequest) {
 // The host clears stale messages before creating a fresh room.
 export async function DELETE(request: NextRequest) {
   try {
-    await ensureSignalingSchema();
+    await ensureDatabaseSchema();
     const { searchParams } = new URL(request.url);
     const roomId = String(searchParams.get("roomId") || "")
       .trim()
