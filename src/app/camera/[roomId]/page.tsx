@@ -74,10 +74,13 @@ export default function RemoteCameraPage() {
   const runIdRef = useRef(0);
   const lastSignalIdRef = useRef(0);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const senderIdRef = useRef(
-    `camera-${Math.random().toString(36).slice(2, 9)}`,
-  );
   const previousBytesRef = useRef({ bytes: 0, timestamp: 0 });
+
+  // Purity: Lazy initializer inside effect or via a ref checks
+  const senderIdRef = useRef<string | null>(null);
+  if (senderIdRef.current === null) {
+    senderIdRef.current = `camera-${Math.random().toString(36).slice(2, 9)}`;
+  }
 
   const [status, setStatus] = useState<ConnectionStatus>("camera");
   const [facing, setFacing] =
@@ -87,6 +90,7 @@ export default function RemoteCameraPage() {
   );
   const [errorMessage, setErrorMessage] = useState("");
   const [waitSeconds, setWaitSeconds] = useState(0);
+  const [hasActiveStream, setHasActiveStream] = useState(false);
   const [stats, setStats] = useState<StreamStats>({
     width: 0,
     height: 0,
@@ -125,6 +129,7 @@ export default function RemoteCameraPage() {
 
         streamRef.current?.getTracks().forEach((track) => track.stop());
         streamRef.current = stream;
+        setHasActiveStream(true);
 
         const track = stream.getVideoTracks()[0];
         if (track) {
@@ -142,7 +147,7 @@ export default function RemoteCameraPage() {
               advanced: ([{ focusMode: "continuous" }] as unknown) as MediaTrackConstraintSet[],
             });
           } catch {
-            // Continuous focus is optional and is not exposed by iOS Safari.
+            // Continuous focus is optional.
           }
         }
 
@@ -161,6 +166,7 @@ export default function RemoteCameraPage() {
             : message,
         );
         setStatus("failed");
+        setHasActiveStream(false);
         return null;
       }
     },
@@ -198,7 +204,7 @@ export default function RemoteCameraPage() {
       }
 
       pc.onicecandidate = (event) => {
-        if (event.candidate) {
+        if (event.candidate && senderIdRef.current) {
           void postSignal(
             roomId,
             senderIdRef.current,
@@ -228,6 +234,7 @@ export default function RemoteCameraPage() {
       };
 
       setStatus("waiting");
+      if (!senderIdRef.current) return;
       const readySent = await postSignal(
         roomId,
         senderIdRef.current,
@@ -246,7 +253,7 @@ export default function RemoteCameraPage() {
       const startedAt = Date.now();
       let offerReceived = false;
 
-      while (runIdRef.current === runId && pcRef.current === pc) {
+      while (runIdRef.current === runId && pcRef.current === pc && senderIdRef.current) {
         const messages = await getSignals(
           roomId,
           senderIdRef.current,
@@ -260,7 +267,7 @@ export default function RemoteCameraPage() {
           );
 
           if (message.msgType === "offer") {
-            // Protect established connection: ignore duplicate/belated offers once stable/connected.
+            // Protect established connection
             if (offerReceived || pc.signalingState !== "stable" || pc.connectionState === "connected") {
               continue;
             }
@@ -279,7 +286,7 @@ export default function RemoteCameraPage() {
                 try {
                   await pc.addIceCandidate(candidate);
                 } catch {
-                  // Ignore candidates belonging to an older negotiation.
+                  // Ignore stale candidate
                 }
               }
 
@@ -311,7 +318,7 @@ export default function RemoteCameraPage() {
               try {
                 await pc.addIceCandidate(candidate);
               } catch {
-                // Ignore stale ICE candidates.
+                // Ignore stale ICE candidate
               }
             } else {
               pendingCandidatesRef.current.push(candidate);
@@ -341,13 +348,19 @@ export default function RemoteCameraPage() {
     [facing, openCamera, roomId, stopPeer],
   );
 
+  // Avoid synchronous setState during rendering effect warnings
   useEffect(() => {
     const senderId = senderIdRef.current;
-    void startConnection(true);
+    if (!senderId) return;
+    const timer = setTimeout(() => {
+      void startConnection(true);
+    }, 10);
     return () => {
+      clearTimeout(timer);
       stopPeer();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
+      setHasActiveStream(false);
       void postSignal(roomId, senderId, "bye", { at: Date.now() });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -547,7 +560,7 @@ export default function RemoteCameraPage() {
         </div>
       )}
 
-      {status === "failed" && !streamRef.current && (
+      {status === "failed" && !hasActiveStream && (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/85 p-5">
           <div className="max-w-sm text-center">
             <div className="mb-3 text-5xl">📷</div>

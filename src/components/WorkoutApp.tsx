@@ -258,7 +258,8 @@ function estimateSharpness(ctx: CanvasRenderingContext2D, width: number, height:
 /* ------------------------------------------------------------------ */
 export default function WorkoutApp() {
   /* refs */
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const analysisCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const landmarkerRef = useRef<MpPoseLandmarker | null>(null);
@@ -280,7 +281,20 @@ export default function WorkoutApp() {
   const [multiPerson, setMultiPerson] = useState(false);
   const [showMenu, setShowMenu] = useState(true);
   const [sessionExercises, setSessionExercises] = useState<{ type: ExerciseType; reps: number; duration: number; quality: number }[]>([]);
-  const [sessionStartTime] = useState(Date.now());
+  
+  // Purity: Wrap Date.now() in lazy initializer function
+  const [sessionStartTime] = useState(() => Date.now());
+  
+  // Purity: Time state updating every second to avoid Date.now() inside render JSX body
+  const [currentTime, setCurrentTime] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
   const [totalSessionReps, setTotalSessionReps] = useState(0);
   const [showCompletion, setShowCompletion] = useState(false);
   const [challengeMode, setChallengeMode] = useState(false);
@@ -304,33 +318,39 @@ export default function WorkoutApp() {
   const [remoteStatus, setRemoteStatus] = useState<RemoteConnectionStatus>("idle");
   const [remoteError, setRemoteError] = useState("");
   const [linkCopied, setLinkCopied] = useState(false);
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const remotePcRef = useRef<RTCPeerConnection | null>(null);
   const remoteStoppedRef = useRef(false);
   const remoteLastIdRef = useRef(0);
   const remotePendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
 
   /* mutable refs for closures */
   const stateRef = useRef(exerciseState);
-  stateRef.current = exerciseState;
   const exRef = useRef(selectedExercise);
-  exRef.current = selectedExercise;
   const trackRef = useRef(isTracking);
-  trackRef.current = isTracking;
   const prevReps = useRef(0);
   const prevFeedbackLen = useRef(0);
   const personLostTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const multiPersonTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const camerasRef = useRef(cameras);
-  camerasRef.current = cameras;
   const activeCameraRef = useRef(activeCameraId);
-  activeCameraRef.current = activeCameraId;
   const voiceOnRef = useRef(voiceOn);
-  voiceOnRef.current = voiceOn;
   const cameraQualityRef = useRef<CameraQuality>(cameraQuality);
-  cameraQualityRef.current = cameraQuality;
   const statusRef = useRef(status);
-  statusRef.current = status;
+  const localFacingRef = useRef<"user" | "environment">(localFacing);
+
+  // Purity: Update refs inside an effect instead of during render
+  useEffect(() => {
+    stateRef.current = exerciseState;
+    exRef.current = selectedExercise;
+    trackRef.current = isTracking;
+    camerasRef.current = cameras;
+    activeCameraRef.current = activeCameraId;
+    voiceOnRef.current = voiceOn;
+    cameraQualityRef.current = cameraQuality;
+    statusRef.current = status;
+    localFacingRef.current = localFacing;
+  }, [exerciseState, selectedExercise, isTracking, cameras, activeCameraId, voiceOn, cameraQuality, status, localFacing]);
 
   /* ---- voice announcements triggered by state changes ---- */
   useEffect(() => {
@@ -381,12 +401,14 @@ export default function WorkoutApp() {
         const settings = track.getSettings();
         if (settings.width && settings.height) {
           setVideoDimensions({ width: settings.width, height: settings.height });
+          lastDimensionsRef.current = { width: settings.width, height: settings.height };
         }
       }
       setLocalFacing(facingMode);
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+      localFacingRef.current = facingMode;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        await localVideoRef.current.play();
       }
       setCameras((previous) => {
         const withoutLocal = previous.filter((camera) => camera.id !== "local-default");
@@ -438,12 +460,56 @@ export default function WorkoutApp() {
     }
   }, []);
 
+  /* Hoisting Fix: Declare switcher camera function BEFORE calling it in remote connect loop */
+  const switchToCamera = useCallback((cameraId: string) => {
+    const camera = camerasRef.current.find((item) => item.id === cameraId);
+    const video = cameraId === "local-default" ? localVideoRef.current : remoteVideoRef.current;
+    if (!camera?.stream || !video) {
+      console.warn("Camera or stream not found for ID:", cameraId);
+      return;
+    }
+
+    setActiveCameraId(cameraId);
+    activeCameraRef.current = cameraId;
+    setAutoplayBlocked(false);
+
+    // Reset video player parameters explicitly
+    video.pause();
+    video.srcObject = camera.stream;
+    video.muted = true;
+    video.playsInline = true;
+
+    // Force reloading of stream dimensions on metadata load
+    video.onloadedmetadata = () => {
+      if (video.videoWidth && video.videoHeight) {
+        setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
+        lastDimensionsRef.current = { width: video.videoWidth, height: video.videoHeight };
+      }
+    };
+
+    video.play()
+      .then(() => {
+        lastTimeRef.current = -1;
+        lastInferenceAtRef.current = 0;
+        lastResultRef.current = null;
+        primaryCenterRef.current = null;
+        setPersonDetected(false);
+        setAutoplayBlocked(false);
+      })
+      .catch((error: unknown) => {
+        console.warn("Failed to play switched camera stream (autoplay blocked):", error);
+        setAutoplayBlocked(true);
+      });
+  }, []);
+
   /* ---- display at source quality; infer at ~20 FPS on max 640px ---- */
   const loop = useCallback(() => {
-    const video = videoRef.current;
+    const isLocal = activeCameraRef.current === "local-default";
+    const video = isLocal ? localVideoRef.current : remoteVideoRef.current;
     const canvas = canvasRef.current;
     const landmarker = landmarkerRef.current;
     if (!video || !canvas || !landmarker || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+      // Hoisting Fix: reference itself correctly
       animRef.current = requestAnimationFrame(loop);
       return;
     }
@@ -484,8 +550,13 @@ export default function WorkoutApp() {
         const analysis = analysisCanvasRef.current || document.createElement("canvas");
         analysisCanvasRef.current = analysis;
         const aspect = sourceWidth / sourceHeight;
-        analysis.width = aspect >= 1 ? 640 : Math.max(320, Math.round(640 * aspect));
-        analysis.height = aspect >= 1 ? Math.max(320, Math.round(640 / aspect)) : 640;
+        
+        // Pure implementation: avoid mutating state inside rendering directly
+        const targetWidth = aspect >= 1 ? 640 : Math.max(320, Math.round(640 * aspect));
+        const targetHeight = aspect >= 1 ? Math.max(320, Math.round(640 / aspect)) : 640;
+        analysis.width = targetWidth;
+        analysis.height = targetHeight;
+        
         const analysisCtx = analysis.getContext("2d", { willReadFrequently: true });
 
         if (analysisCtx) {
@@ -624,14 +695,16 @@ export default function WorkoutApp() {
   /* ---- switch local camera ---- */
   const switchLocalCamera = useCallback(async () => {
     const currentLocal = camerasRef.current.find((camera) => camera.id === "local-default");
-    currentLocal?.stream?.getTracks().forEach((track) => track.stop());
-    const nextFacing = localFacing === "user" ? "environment" : "user";
+    if (currentLocal?.stream) {
+      currentLocal.stream.getTracks().forEach((track) => track.stop());
+    }
+    const nextFacing = localFacingRef.current === "user" ? "environment" : "user";
     const stream = await initCamera(nextFacing);
     if (stream) {
       setActiveCameraId("local-default");
       lastTimeRef.current = -1;
     }
-  }, [initCamera, localFacing]);
+  }, [initCamera]);
 
   /* ---- Remote camera WebRTC ---- */
   const startRemoteHost = useCallback(async (code: string) => {
@@ -689,18 +762,18 @@ export default function WorkoutApp() {
         // Low-latency receiver hints are not supported by every browser.
       }
 
-      let remoteVideo = remoteVideoRef.current;
-      if (!remoteVideo) {
-        remoteVideo = document.createElement("video");
-        remoteVideo.playsInline = true;
+      if (remoteVideoRef.current) {
+        const remoteVideo = remoteVideoRef.current;
+        remoteVideo.pause();
+        remoteVideo.srcObject = stream;
         remoteVideo.muted = true;
-        remoteVideo.autoplay = true;
-        remoteVideo.style.display = "none";
-        document.body.appendChild(remoteVideo);
-        remoteVideoRef.current = remoteVideo;
+        remoteVideo.playsInline = true;
+        remoteVideo.play()
+          .catch((err) => {
+            console.warn("Autoplay blocked on remote track play:", err);
+            setAutoplayBlocked(true);
+          });
       }
-      remoteVideo.srcObject = stream;
-      void remoteVideo.play();
 
       setCameras((previous) => {
         const withoutCurrent = previous.filter(
@@ -808,11 +881,7 @@ export default function WorkoutApp() {
               await pc.setRemoteDescription(answer);
               const queued = remotePendingCandidatesRef.current.splice(0);
               for (const candidate of queued) {
-                try {
-                  await pc.addIceCandidate(candidate);
-                } catch {
-                  // Ignore candidates from an older negotiation.
-                }
+                try { await pc.addIceCandidate(candidate); } catch { /* ignore stale candidate */ }
               }
             }
           } catch {
@@ -842,7 +911,7 @@ export default function WorkoutApp() {
       await wait(pc.connectionState === "connected" ? 1000 : 350);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [switchToCamera]);
 
   const generateRoom = useCallback(async () => {
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -893,44 +962,6 @@ export default function WorkoutApp() {
     }
   }, [roomCode]);
 
-  const switchToCamera = useCallback((cameraId: string) => {
-    const camera = camerasRef.current.find((item) => item.id === cameraId);
-    if (!camera?.stream || !videoRef.current) {
-      console.warn("Camera or stream not found for ID:", cameraId);
-      return;
-    }
-
-    setActiveCameraId(cameraId);
-    activeCameraRef.current = cameraId;
-
-    // Reset video player parameters explicitly
-    const video = videoRef.current;
-    video.pause();
-    video.srcObject = camera.stream;
-    video.muted = true;
-    video.playsInline = true;
-
-    // Force reloading of stream dimensions on metadata load
-    video.onloadedmetadata = () => {
-      if (video.videoWidth && video.videoHeight) {
-        setVideoDimensions({ width: video.videoWidth, height: video.videoHeight });
-        lastDimensionsRef.current = { width: video.videoWidth, height: video.videoHeight };
-      }
-    };
-
-    video.play()
-      .then(() => {
-        lastTimeRef.current = -1;
-        lastInferenceAtRef.current = 0;
-        lastResultRef.current = null;
-        primaryCenterRef.current = null;
-        setPersonDetected(false);
-      })
-      .catch((error) => {
-        console.error("Failed to play switched camera stream:", error);
-      });
-  }, []);
-
   /* ---- exercise handlers ---- */
   const selectExercise = useCallback((type: ExerciseType) => {
     if (exerciseState.reps > 0) {
@@ -939,7 +970,6 @@ export default function WorkoutApp() {
     }
     resetDetectorState();
     const freshState = createExerciseState(type);
-    stateRef.current = freshState;
     setSelectedExercise(type);
     setExerciseState(freshState);
     setShowMenu(false);
@@ -951,7 +981,6 @@ export default function WorkoutApp() {
   const resetCurrentExercise = useCallback(() => {
     resetDetectorState();
     const freshState = createExerciseState(selectedExercise);
-    stateRef.current = freshState;
     setExerciseState(freshState);
     setChallengeCompleted(false);
     prevReps.current = 0;
@@ -967,7 +996,6 @@ export default function WorkoutApp() {
       if (voiceOn) unlockVoice();
       resetDetectorState();
       const freshState = createExerciseState(selectedExercise);
-      stateRef.current = freshState;
       setExerciseState(freshState);
       setIsTracking(true);
       setStatus(personDetected && poseCoverage >= 50 ? "detecting" : "paused");
@@ -981,12 +1009,16 @@ export default function WorkoutApp() {
     }
   }, [isTracking, selectedExercise, voiceOn, exerciseState.reps, personDetected, poseCoverage]);
 
+  // Synchronous State cascading triggers fix
   useEffect(() => {
     if (challengeMode && !challengeCompleted && exerciseState.reps >= challengeTarget) {
-      setChallengeCompleted(true);
-      setShowCompletion(true);
-      const info = EXERCISES.find((e) => e.id === selectedExercise);
-      if (voiceOn && info) announceChallenge(challengeTarget, info.nameZh);
+      const timer = setTimeout(() => {
+        setChallengeCompleted(true);
+        setShowCompletion(true);
+        const exerciseInfo = EXERCISES.find((e) => e.id === selectedExercise);
+        if (voiceOn && exerciseInfo) announceChallenge(challengeTarget, exerciseInfo.nameZh);
+      }, 50);
+      return () => clearTimeout(timer);
     }
   }, [exerciseState.reps, challengeMode, challengeTarget, challengeCompleted, voiceOn, selectedExercise]);
 
@@ -1012,11 +1044,12 @@ export default function WorkoutApp() {
 
   /* cleanup remote on unmount */
   useEffect(() => {
+    const remoteVideo = remoteVideoRef.current;
     return () => {
       remoteStoppedRef.current = true;
       remotePcRef.current?.close();
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.remove();
+      if (remoteVideo) {
+        try { remoteVideo.pause(); remoteVideo.srcObject = null; } catch { /* ignore */ }
       }
     };
   }, []);
@@ -1075,7 +1108,19 @@ export default function WorkoutApp() {
               }}
             >
               <video
-                ref={videoRef}
+                ref={localVideoRef}
+                style={{
+                  position: "absolute",
+                  opacity: 0,
+                  width: "4px",
+                  height: "4px",
+                  pointerEvents: "none",
+                }}
+                playsInline
+                muted
+              />
+              <video
+                ref={remoteVideoRef}
                 style={{
                   position: "absolute",
                   opacity: 0,
@@ -1087,6 +1132,28 @@ export default function WorkoutApp() {
                 muted
               />
               <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-gray-900" />
+
+              {/* Autoplay blocked fallback overlay */}
+              {autoplayBlocked && (
+                <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/85 p-4 text-center">
+                  <span className="mb-2 block text-5xl">▶️</span>
+                  <p className="text-sm font-bold text-cyan-400 sm:text-base">手機鏡頭已連線！</p>
+                  <p className="mt-1 text-xs text-gray-300">請點選下方按鈕，啟用視訊流播放與 AI 骨架偵測</p>
+                  <button
+                    onClick={() => {
+                      const video = activeCameraRef.current === "local-default" ? localVideoRef.current : remoteVideoRef.current;
+                      if (video) {
+                        video.play()
+                          .then(() => setAutoplayBlocked(false))
+                          .catch(() => {});
+                      }
+                    }}
+                    className="mt-4 rounded-xl bg-cyan-500 px-5 py-2.5 text-xs font-bold text-black shadow-lg shadow-cyan-500/20 hover:bg-cyan-600 active:scale-95"
+                  >
+                    ▶️ 啟用手機畫面
+                  </button>
+                </div>
+              )}
 
               {/* person-lost overlay */}
               {!personDetected && isTracking && (
@@ -1309,7 +1376,7 @@ export default function WorkoutApp() {
               <h3 className="text-xs sm:text-sm font-bold text-gray-300 mb-2">📊 本次訓練</h3>
               <div className="grid grid-cols-2 gap-2 text-center">
                 <div className="bg-white/5 rounded-lg p-2"><div className="text-lg sm:text-xl font-bold text-cyan-400">{totalSessionReps + exerciseState.reps}</div><div className="text-[10px] text-gray-400">總次數</div></div>
-                <div className="bg-white/5 rounded-lg p-2"><div className="text-lg sm:text-xl font-bold text-purple-400">{fmt(Math.round((Date.now() - sessionStartTime) / 1000))}</div><div className="text-[10px] text-gray-400">總時長</div></div>
+                <div className="bg-white/5 rounded-lg p-2"><div className="text-lg sm:text-xl font-bold text-purple-400">{fmt(Math.round((currentTime - sessionStartTime) / 1000))}</div><div className="text-[10px] text-gray-400">總時長</div></div>
               </div>
               {sessionExercises.length > 0 && (
                 <div className="mt-2 space-y-1">
