@@ -23,10 +23,82 @@ export default function HistoryPage() {
   useEffect(() => {
     (async () => {
       try {
+        // Fetch from cloud
         const [wr, lr] = await Promise.all([fetch("/api/workouts"), fetch("/api/leaderboard")]);
         const wd = await wr.json(); const ld = await lr.json();
-        setSessions(wd.sessions || []); setDaily(wd.dailyStats || []); setLb(ld.leaderboard || []);
-      } catch { /* skip */ } finally { setLoading(false); }
+        
+        const cloudSessions = (wd.sessions || []) as Session[];
+        
+        // Retrieve and merge any locally saved offline backups!
+        let offlineSessions: Session[] = [];
+        try {
+          const stored = localStorage.getItem("offline_workout_sessions");
+          if (stored) {
+            const rawParsed = JSON.parse(stored) as Array<{
+              id: string;
+              startedAt: string;
+              totalDuration: number;
+              totalReps: number;
+              avgQuality: number;
+              exercises: Array<{ type: string; reps: number; duration: number; quality: number }>;
+            }>;
+            offlineSessions = rawParsed.map((s, idx) => ({
+              id: -(idx + 1), // use negative numbers for local id
+              startedAt: s.startedAt,
+              totalDuration: s.totalDuration,
+              totalReps: s.totalReps,
+              avgQuality: s.avgQuality,
+              exercises: s.exercises.map((ex, exIdx) => ({
+                id: -(exIdx + 100),
+                exerciseType: ex.type,
+                reps: ex.reps,
+                duration: ex.duration,
+                avgQuality: ex.quality,
+              })),
+            }));
+          }
+        } catch { /* ignore offline read errors */ }
+
+        const merged = [...offlineSessions, ...cloudSessions];
+        // Sort merged sessions by startedAt in descending order
+        merged.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
+
+        setSessions(merged);
+        setDaily(wd.dailyStats || []);
+        setLb(ld.leaderboard || []);
+      } catch { 
+        // Entirely offline mode! Display only offline sessions
+        try {
+          const stored = localStorage.getItem("offline_workout_sessions");
+          if (stored) {
+            const rawParsed = JSON.parse(stored) as Array<{
+              id: string;
+              startedAt: string;
+              totalDuration: number;
+              totalReps: number;
+              avgQuality: number;
+              exercises: Array<{ type: string; reps: number; duration: number; quality: number }>;
+            }>;
+            const offline = rawParsed.map((s, idx) => ({
+              id: -(idx + 1),
+              startedAt: s.startedAt,
+              totalDuration: s.totalDuration,
+              totalReps: s.totalReps,
+              avgQuality: s.avgQuality,
+              exercises: s.exercises.map((ex, exIdx) => ({
+                id: -(exIdx + 100),
+                exerciseType: ex.type,
+                reps: ex.reps,
+                duration: ex.duration,
+                avgQuality: ex.quality,
+              })),
+            }));
+            setSessions(offline);
+          }
+        } catch { /* ignore offline read errors */ }
+      } finally { 
+        setLoading(false); 
+      }
     })();
   }, []);
 
@@ -107,7 +179,14 @@ export default function HistoryPage() {
                 ) : sessions.map((s) => (
                   <div key={s.id} className="bg-white/5 backdrop-blur rounded-xl sm:rounded-2xl p-3 sm:p-5 border border-white/10">
                     <div className="flex items-center justify-between mb-2 sm:mb-3 flex-wrap gap-1">
-                      <div className="text-xs sm:text-sm text-gray-400">{fmtDate(s.startedAt)}</div>
+                      <div className="text-xs sm:text-sm text-gray-400 flex items-center gap-1.5">
+                        {fmtDate(s.startedAt)}
+                        {Number(s.id) < 0 && (
+                          <span className="inline-block px-2 py-0.5 rounded-full bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-[10px] font-semibold animate-pulse">
+                            📱 本機暫存
+                          </span>
+                        )}
+                      </div>
                       <div className="flex items-center gap-2 sm:gap-3 text-xs sm:text-sm">
                         <span className="text-cyan-400 font-bold">{s.totalReps} 次</span>
                         <span className="text-gray-500">·</span>

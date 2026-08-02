@@ -37,6 +37,12 @@ import {
   tuneVideoSender,
   wait,
 } from "@/lib/webrtc";
+import {
+  playRepSound,
+  playWarningSound,
+  playCountdownTick,
+  playChallengeSuccessSound,
+} from "@/lib/sound-effects";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -65,6 +71,94 @@ interface CameraSource {
 /* ------------------------------------------------------------------ */
 /*  Drawing                                                            */
 /* ------------------------------------------------------------------ */
+function drawRadarCircle(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  label = "等待人體進入"
+) {
+  const cx = w / 2;
+  const cy = h / 2;
+  const r = Math.min(w, h) * 0.22;
+  const time = Date.now() / 1000;
+
+  ctx.save();
+  ctx.shadowBlur = 15;
+  ctx.shadowColor = "rgba(6,182,212,0.4)";
+
+  // Outer rotating target dashed ring
+  ctx.strokeStyle = "rgba(6,182,212,0.75)";
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+  ctx.setLineDash([12, 18]);
+  ctx.stroke();
+
+  // Inner rotating ring with opposite rotation
+  ctx.strokeStyle = "rgba(34,211,238,0.5)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r - 12, 0, 2 * Math.PI);
+  ctx.setLineDash([6, 12]);
+  ctx.stroke();
+
+  // Radar sweeping line
+  ctx.strokeStyle = "rgba(34,211,238,0.25)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(time * 2) * r, cy + Math.sin(time * 2) * r);
+  ctx.stroke();
+
+  // Center targeting point
+  ctx.fillStyle = "rgba(34,211,238,0.9)";
+  ctx.beginPath();
+  ctx.arc(cx, cy, 5, 0, 2 * Math.PI);
+  ctx.fill();
+
+  // Draw circular corners
+  ctx.strokeStyle = "rgba(34,211,238,0.7)";
+  ctx.lineWidth = 3;
+  const cornerLen = 20;
+  
+  // Top-Left corner
+  ctx.beginPath();
+  ctx.moveTo(cx - r - cornerLen, cy - r);
+  ctx.lineTo(cx - r, cy - r);
+  ctx.lineTo(cx - r, cy - r - cornerLen);
+  ctx.stroke();
+
+  // Top-Right corner
+  ctx.beginPath();
+  ctx.moveTo(cx + r + cornerLen, cy - r);
+  ctx.lineTo(cx + r, cy - r);
+  ctx.lineTo(cx + r, cy - r - cornerLen);
+  ctx.stroke();
+
+  // Bottom-Left corner
+  ctx.beginPath();
+  ctx.moveTo(cx - r - cornerLen, cy + r);
+  ctx.lineTo(cx - r, cy + r);
+  ctx.lineTo(cx - r, cy + r + cornerLen);
+  ctx.stroke();
+
+  // Bottom-Right corner
+  ctx.beginPath();
+  ctx.moveTo(cx + r + cornerLen, cy + r);
+  ctx.lineTo(cx + r, cy + r);
+  ctx.lineTo(cx + r, cy + r + cornerLen);
+  ctx.stroke();
+
+  // High-tech Calibration label
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "rgba(34,211,238,0.95)";
+  ctx.font = `bold ${Math.max(12, Math.round(w / 60))}px monospace`;
+  ctx.textAlign = "center";
+  ctx.fillText(`📡 [ ${label} ]`, cx, cy + r + 32);
+
+  ctx.restore();
+}
+
 function drawSkeleton(
   ctx: CanvasRenderingContext2D,
   landmarks: Point3D[],
@@ -72,15 +166,16 @@ function drawSkeleton(
   h: number,
   quality: number
 ) {
-  const hue = quality > 75 ? 145 : quality > 50 ? 45 : 0;
-  const jointColor = `hsl(${hue}, 90%, 55%)`;
-  const lineColor = `hsla(${hue}, 80%, 60%, 0.8)`;
-  const glowColor = `hsla(${hue}, 100%, 60%, 0.35)`;
+  // Cyberpunk Neon Glow Scheme
+  const hue = quality > 75 ? 175 : quality > 50 ? 45 : 0; // Cyan (175) is cooler than green!
+  const jointColor = `hsl(${hue}, 100%, 55%)`;
+  const lineColor = `hsla(${hue}, 90%, 65%, 0.85)`;
+  const glowColor = `hsla(${hue}, 100%, 60%, 0.45)`;
 
-  ctx.lineWidth = Math.max(2, Math.round(w / 250));
+  ctx.lineWidth = Math.max(3, Math.round(w / 220));
   ctx.strokeStyle = lineColor;
   ctx.shadowColor = glowColor;
-  ctx.shadowBlur = 10;
+  ctx.shadowBlur = 12;
 
   for (const [i, j] of POSE_CONNECTIONS) {
     const a = landmarks[i];
@@ -101,17 +196,17 @@ function drawSkeleton(
     LANDMARK.LEFT_ANKLE as number, LANDMARK.RIGHT_ANKLE as number,
   ]);
 
-  ctx.shadowBlur = 14;
+  ctx.shadowBlur = 18;
   for (let i = 0; i < landmarks.length; i++) {
     const lm = landmarks[i];
     if ((lm.visibility ?? 0) < 0.35) continue;
-    const r = keyJoints.has(i) ? Math.max(5, Math.round(w / 160)) : Math.max(2.5, Math.round(w / 300));
+    const r = keyJoints.has(i) ? Math.max(6, Math.round(w / 140)) : Math.max(3, Math.round(w / 260));
     ctx.beginPath();
     ctx.arc(lm.x * w, lm.y * h, r, 0, 2 * Math.PI);
     ctx.fillStyle = jointColor;
     ctx.fill();
     ctx.strokeStyle = "#fff";
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 2;
     ctx.stroke();
   }
   ctx.shadowBlur = 0;
@@ -352,23 +447,28 @@ export default function WorkoutApp() {
     localFacingRef.current = localFacing;
   }, [exerciseState, selectedExercise, isTracking, cameras, activeCameraId, voiceOn, cameraQuality, status, localFacing]);
 
-  /* ---- voice announcements triggered by state changes ---- */
+  /* ---- voice announcements and synthesized sound effects triggered by state changes ---- */
   useEffect(() => {
-    if (!voiceOn) return;
     if (exerciseState.reps > prevReps.current && exerciseState.reps > 0) {
-      const shouldSpeak = selectedExercise !== "plank" || exerciseState.reps % 5 === 0;
-      if (shouldSpeak) announceRep(exerciseState.reps, exerciseState.quality);
-      if (challengeMode) announceChallengeProgress(exerciseState.reps, challengeTarget);
+      // Rep Sound Effect is played with dynamic pitch based on execution quality
+      playRepSound(exerciseState.quality);
+      
+      if (voiceOn) {
+        const shouldSpeak = selectedExercise !== "plank" || exerciseState.reps % 5 === 0;
+        if (shouldSpeak) announceRep(exerciseState.reps, exerciseState.quality);
+        if (challengeMode) announceChallengeProgress(exerciseState.reps, challengeTarget);
+      }
     }
     prevReps.current = exerciseState.reps;
   }, [exerciseState.reps, exerciseState.quality, voiceOn, selectedExercise, challengeMode, challengeTarget]);
 
   useEffect(() => {
-    if (!voiceOn) return;
     if (exerciseState.feedback.length > prevFeedbackLen.current) {
       const latest = exerciseState.feedback[exerciseState.feedback.length - 1];
       if (latest && latest.type === "warning") {
-        announceFormCorrection(latest.message);
+        // Warning sound effect played in addition to voice prompt
+        playWarningSound();
+        if (voiceOn) announceFormCorrection(latest.message);
       }
     }
     prevFeedbackLen.current = exerciseState.feedback.length;
@@ -533,16 +633,9 @@ export default function WorkoutApp() {
       lastTimeRef.current = video.currentTime;
       const isLocal = camerasRef.current.find((camera) => camera.id === activeCameraRef.current)?.type !== "remote";
 
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
-      ctx.save();
-      if (isLocal) {
-        ctx.scale(-1, 1);
-        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
-      } else {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      }
-      ctx.restore();
+       // Clear the overlay canvas to keep it fully transparent.
+      // The actual video element is natively displayed right behind this canvas!
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       const now = performance.now();
       if (now - lastInferenceAtRef.current >= 50) {
@@ -627,6 +720,7 @@ export default function WorkoutApp() {
                 if (changed) setExerciseState(next);
               } else if (trackRef.current && !usable) {
                 setStatus("paused");
+                drawRadarCircle(ctx, canvas.width, canvas.height, "請退後一點，讓全身入鏡");
               }
 
               if (trackRef.current) {
@@ -649,6 +743,9 @@ export default function WorkoutApp() {
               personWasDetectedRef.current = false;
               primaryCenterRef.current = null;
               setPersonDetected(false);
+              // Draw revolving radar circle in center when no person is present
+              drawRadarCircle(ctx, canvas.width, canvas.height, "等待人體進入");
+              
               if (trackRef.current) {
                 setStatus("paused");
                 if (!personLostTimer.current) {
@@ -1003,8 +1100,13 @@ export default function WorkoutApp() {
       prevReps.current = 0;
       prevFeedbackLen.current = 0;
       const exercise = EXERCISES.find((item) => item.id === selectedExercise);
+      // Play sweet countdown sound effects in sync!
+      playCountdownTick();
       if (voiceOn && exercise) {
-        window.setTimeout(() => announceExerciseStart(exercise.nameZh), 250);
+        window.setTimeout(() => {
+          playCountdownTick();
+          announceExerciseStart(exercise.nameZh);
+        }, 250);
       }
     }
   }, [isTracking, selectedExercise, voiceOn, exerciseState.reps, personDetected, poseCoverage]);
@@ -1015,6 +1117,8 @@ export default function WorkoutApp() {
       const timer = setTimeout(() => {
         setChallengeCompleted(true);
         setShowCompletion(true);
+        // Play sweet triumphant sound effects!
+        playChallengeSuccessSound();
         const exerciseInfo = EXERCISES.find((e) => e.id === selectedExercise);
         if (voiceOn && exerciseInfo) announceChallenge(challengeTarget, exerciseInfo.nameZh);
       }, 50);
@@ -1029,10 +1133,39 @@ export default function WorkoutApp() {
     const tr = all.reduce((s, e) => s + e.reps, 0);
     const td = Math.round((Date.now() - sessionStartTime) / 1000);
     const aq = all.reduce((s, e) => s + e.quality, 0) / all.length;
+
+    const payload = { totalDuration: td, totalReps: tr, avgQuality: Math.round(aq), exercises: all };
+
     try {
-      await fetch("/api/workouts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ totalDuration: td, totalReps: tr, avgQuality: Math.round(aq), exercises: all }) });
-      if (voiceOn) speak("運動紀錄已儲存");
-    } catch { /* skip */ }
+      const res = await fetch("/api/workouts", { 
+        method: "POST", 
+        headers: { "Content-Type": "application/json" }, 
+        body: JSON.stringify(payload) 
+      });
+      if (res.ok) {
+        if (voiceOn) speak("運動紀錄已儲存", "high");
+        alert("✅ 運動紀錄已成功儲存至雲端！");
+      } else {
+        throw new Error("Server rejected request");
+      }
+    } catch { 
+      // Safe offline recovery! Store session locally inside localStorage
+      try {
+        const key = "offline_workout_sessions";
+        const existing = JSON.parse(localStorage.getItem(key) || "[]") as Array<typeof payload & { id: string; startedAt: string }>;
+        const newSession = {
+          ...payload,
+          id: `offline-${Math.random().toString(36).slice(2, 9)}`,
+          startedAt: new Date().toISOString(),
+        };
+        existing.push(newSession);
+        localStorage.setItem(key, JSON.stringify(existing));
+        if (voiceOn) speak("雲端連線異常，已自動備份至本機暫存", "high");
+        alert("💾 雲端連線失敗，運動紀錄已為您安全備份至本機暫存！連線後將自動同步。");
+      } catch {
+        alert("❌ 儲存失敗，且本機儲存空間已滿，請確認網路正常。");
+      }
+    }
   }, [sessionExercises, exerciseState, sessionStartTime, voiceOn]);
 
   const toggleVoice = useCallback(() => {
@@ -1109,29 +1242,21 @@ export default function WorkoutApp() {
             >
               <video
                 ref={localVideoRef}
-                style={{
-                  position: "absolute",
-                  opacity: 0,
-                  width: "4px",
-                  height: "4px",
-                  pointerEvents: "none",
-                }}
+                className={`w-full h-full object-contain bg-black scale-x-[-1] ${
+                  activeCameraId === "local-default" ? "block" : "hidden"
+                }`}
                 playsInline
                 muted
               />
               <video
                 ref={remoteVideoRef}
-                style={{
-                  position: "absolute",
-                  opacity: 0,
-                  width: "4px",
-                  height: "4px",
-                  pointerEvents: "none",
-                }}
+                className={`w-full h-full object-contain bg-black ${
+                  activeCameraId !== "local-default" ? "block" : "hidden"
+                }`}
                 playsInline
                 muted
               />
-              <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-gray-900 object-contain" />
+              <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-transparent pointer-events-none" />
 
               {/* Autoplay blocked fallback overlay */}
               {autoplayBlocked && (
