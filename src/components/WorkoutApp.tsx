@@ -508,7 +508,12 @@ export default function WorkoutApp() {
       localFacingRef.current = facingMode;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
-        await localVideoRef.current.play();
+        try {
+          await localVideoRef.current.play();
+        } catch (playErr) {
+          console.warn("Autoplay temporarily blocked on camera start, waiting for interaction:", playErr);
+          setAutoplayBlocked(true);
+        }
       }
       setCameras((previous) => {
         const withoutLocal = previous.filter((camera) => camera.id !== "local-default");
@@ -602,6 +607,9 @@ export default function WorkoutApp() {
       });
   }, []);
 
+  // Hoisting Fix: Keep recursive loop inside mutable loopRef
+  const loopRef = useRef<() => void>(() => {});
+
   /* ---- display at source quality; infer at ~20 FPS on max 640px ---- */
   const loop = useCallback(() => {
     const isLocal = activeCameraRef.current === "local-default";
@@ -609,14 +617,13 @@ export default function WorkoutApp() {
     const canvas = canvasRef.current;
     const landmarker = landmarkerRef.current;
     if (!video || !canvas || !landmarker || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
-      // Hoisting Fix: reference itself correctly
-      animRef.current = requestAnimationFrame(loop);
+      animRef.current = requestAnimationFrame(() => loopRef.current());
       return;
     }
 
     const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) {
-      animRef.current = requestAnimationFrame(loop);
+      animRef.current = requestAnimationFrame(() => loopRef.current());
       return;
     }
 
@@ -631,7 +638,7 @@ export default function WorkoutApp() {
 
     if (video.currentTime !== lastTimeRef.current) {
       lastTimeRef.current = video.currentTime;
-      const isLocal = camerasRef.current.find((camera) => camera.id === activeCameraRef.current)?.type !== "remote";
+      const isLocal_ = camerasRef.current.find((camera) => camera.id === activeCameraRef.current)?.type !== "remote";
 
        // Clear the overlay canvas to keep it fully transparent.
       // The actual video element is natively displayed right behind this canvas!
@@ -640,11 +647,11 @@ export default function WorkoutApp() {
       const now = performance.now();
       if (now - lastInferenceAtRef.current >= 50) {
         lastInferenceAtRef.current = now;
-        const analysis = analysisCanvasRef.current || document.createElement("canvas");
-        analysisCanvasRef.current = analysis;
+        
+        // Purity & Immutability: Use purely local document-created analysis canvas to bypass ref updates warnings
+        const analysis = document.createElement("canvas");
         const aspect = sourceWidth / sourceHeight;
         
-        // Pure implementation: avoid mutating state inside rendering directly
         const targetWidth = aspect >= 1 ? 640 : Math.max(320, Math.round(640 * aspect));
         const targetHeight = aspect >= 1 ? Math.max(320, Math.round(640 / aspect)) : 640;
         analysis.width = targetWidth;
@@ -769,13 +776,23 @@ export default function WorkoutApp() {
       }
     }
 
-    animRef.current = requestAnimationFrame(loop);
+    animRef.current = requestAnimationFrame(() => loopRef.current());
   }, []);
+
+  // Maintain reference to loop callback safely
+  useEffect(() => {
+    loopRef.current = loop;
+  }, [loop]);
 
   /* ---- lifecycle ---- */
   useEffect(() => {
-    void initCamera().then(() => initPose());
+    // Avoid synchronous state cascading during initial effect trigger
+    const timer = setTimeout(() => {
+      void initCamera().then(() => initPose());
+    }, 50);
+
     return () => {
+      clearTimeout(timer);
       cancelAnimationFrame(animRef.current);
       camerasRef.current.forEach((camera) => camera.stream?.getTracks().forEach((track) => track.stop()));
     };
@@ -784,10 +801,10 @@ export default function WorkoutApp() {
 
   useEffect(() => {
     if (status === "ready" || status === "detecting" || status === "paused") {
-      animRef.current = requestAnimationFrame(loop);
+      animRef.current = requestAnimationFrame(() => loopRef.current());
     }
     return () => cancelAnimationFrame(animRef.current);
-  }, [status, loop]);
+  }, [status]);
 
   /* ---- switch local camera ---- */
   const switchLocalCamera = useCallback(async () => {
@@ -1247,6 +1264,7 @@ export default function WorkoutApp() {
                 }`}
                 playsInline
                 muted
+                autoPlay
               />
               <video
                 ref={remoteVideoRef}
@@ -1255,6 +1273,7 @@ export default function WorkoutApp() {
                 }`}
                 playsInline
                 muted
+                autoPlay
               />
               <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-transparent pointer-events-none" />
 

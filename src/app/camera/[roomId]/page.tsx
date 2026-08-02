@@ -76,11 +76,8 @@ export default function RemoteCameraPage() {
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const previousBytesRef = useRef({ bytes: 0, timestamp: 0 });
 
-  // Purity: Lazy initializer inside effect or via a ref checks
-  const senderIdRef = useRef<string | null>(null);
-  if (senderIdRef.current === null) {
-    senderIdRef.current = `camera-${Math.random().toString(36).slice(2, 9)}`;
-  }
+  // Purity: Initialize ID inside pure lazy useState initializer to satisfy react-hooks/purity
+  const [senderId] = useState(() => `camera-${Math.random().toString(36).slice(2, 9)}`);
 
   const [status, setStatus] = useState<ConnectionStatus>("camera");
   const [facing, setFacing] =
@@ -204,10 +201,10 @@ export default function RemoteCameraPage() {
       }
 
       pc.onicecandidate = (event) => {
-        if (event.candidate && senderIdRef.current) {
+        if (event.candidate && senderId) {
           void postSignal(
             roomId,
-            senderIdRef.current,
+            senderId,
             "candidate",
             event.candidate.toJSON(),
           );
@@ -234,10 +231,10 @@ export default function RemoteCameraPage() {
       };
 
       setStatus("waiting");
-      if (!senderIdRef.current) return;
+      if (!senderId) return;
       const readySent = await postSignal(
         roomId,
-        senderIdRef.current,
+        senderId,
         "ready",
         { at: Date.now() },
       );
@@ -253,10 +250,10 @@ export default function RemoteCameraPage() {
       const startedAt = Date.now();
       let offerReceived = false;
 
-      while (runIdRef.current === runId && pcRef.current === pc && senderIdRef.current) {
+      while (runIdRef.current === runId && pcRef.current === pc && senderId) {
         const messages = await getSignals(
           roomId,
-          senderIdRef.current,
+          senderId,
           lastSignalIdRef.current,
         );
 
@@ -294,7 +291,7 @@ export default function RemoteCameraPage() {
               await pc.setLocalDescription(answer);
               const answerSent = await postSignal(
                 roomId,
-                senderIdRef.current,
+                senderId,
                 "answer",
                 { type: answer.type, sdp: answer.sdp },
               );
@@ -345,16 +342,15 @@ export default function RemoteCameraPage() {
         await wait(pc.connectionState === "connected" ? 1000 : 350);
       }
     },
-    [facing, openCamera, roomId, stopPeer],
+    [facing, openCamera, roomId, stopPeer, senderId],
   );
 
-  // Avoid synchronous setState during rendering effect warnings
+  // Avoid synchronous setState during rendering effect warnings: wrap inside a deferred block safely
   useEffect(() => {
-    const senderId = senderIdRef.current;
     if (!senderId) return;
     const timer = setTimeout(() => {
       void startConnection(true);
-    }, 10);
+    }, 60);
     return () => {
       clearTimeout(timer);
       stopPeer();
@@ -364,7 +360,7 @@ export default function RemoteCameraPage() {
       void postSignal(roomId, senderId, "bye", { at: Date.now() });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [senderId]);
 
   useEffect(() => {
     const timer = window.setInterval(async () => {
