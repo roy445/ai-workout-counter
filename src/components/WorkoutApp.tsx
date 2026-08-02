@@ -640,9 +640,17 @@ export default function WorkoutApp() {
       lastTimeRef.current = video.currentTime;
       const isLocal_ = camerasRef.current.find((camera) => camera.id === activeCameraRef.current)?.type !== "remote";
 
-       // Clear the overlay canvas to keep it fully transparent.
-      // The actual video element is natively displayed right behind this canvas!
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Draw video frame on canvas to 100% guarantee no black screen across any browser
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.save();
+      if (isLocal_) {
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+      } else {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+      ctx.restore();
 
       const now = performance.now();
       if (now - lastInferenceAtRef.current >= 50) {
@@ -1259,23 +1267,37 @@ export default function WorkoutApp() {
             >
               <video
                 ref={localVideoRef}
-                className={`w-full h-full object-contain bg-black scale-x-[-1] ${
-                  activeCameraId === "local-default" ? "block" : "hidden"
-                }`}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  height: "100%",
+                  opacity: 0.01,
+                  pointerEvents: "none",
+                  zIndex: -1,
+                }}
                 playsInline
                 muted
                 autoPlay
               />
               <video
                 ref={remoteVideoRef}
-                className={`w-full h-full object-contain bg-black ${
-                  activeCameraId !== "local-default" ? "block" : "hidden"
-                }`}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  height: "100%",
+                  opacity: 0.01,
+                  pointerEvents: "none",
+                  zIndex: -1,
+                }}
                 playsInline
                 muted
                 autoPlay
               />
-              <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-transparent pointer-events-none" />
+              <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-gray-900 object-contain" />
 
               {/* Autoplay blocked fallback overlay */}
               {autoplayBlocked && (
