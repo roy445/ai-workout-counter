@@ -150,9 +150,7 @@ export function announceRep(count: number, quality = 100): void {
     speak(String(count), "high", `rep-${count}`, 0);
   }
 
-  if (quality < 65) {
-    speak("放慢速度，先確保姿勢正確", "normal", "low-quality", 6000);
-  }
+  // Removed nagging "放慢速度" so the user can exercise fast freely.
 }
 
 export function announceCountdown(nameZh: string): void {

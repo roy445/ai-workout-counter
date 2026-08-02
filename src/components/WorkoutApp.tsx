@@ -1131,7 +1131,7 @@ export default function WorkoutApp() {
                 playsInline
                 muted
               />
-              <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-gray-900" />
+              <canvas ref={canvasRef} className="absolute inset-0 h-full w-full bg-gray-900 object-contain" />
 
               {/* Autoplay blocked fallback overlay */}
               {autoplayBlocked && (

@@ -62,7 +62,8 @@ export interface ExerciseState {
 }
 
 // Minimum time between reps to avoid double counting (ms)
-const MIN_REP_INTERVAL = 450;
+// Lowered to 200ms to allow extremely rapid movement counting.
+const MIN_REP_INTERVAL = 200;
 
 export function createExerciseState(type: ExerciseType): ExerciseState {
   return {
@@ -157,33 +158,24 @@ export function detectSquat(
     if (smoothedAngle > 155) {
       state.phase = "standing";
     }
-    if (smoothedAngle < 140) {
+    if (smoothedAngle < 145) {
       state.phase = "going_down";
     }
   } else if (state.phase === "going_down") {
-    if (smoothedAngle < 100) {
+    if (smoothedAngle < 115) {
       state.phase = "at_bottom";
       // Check quality
-      if (smoothedAngle > 90) {
+      if (smoothedAngle > 105) {
         quality -= 15;
         addFeedback(state, "⚠️ 再蹲低一些，膝蓋角度不足", "warning");
       }
-      if (backAngle > 30) {
-        quality -= 20;
-        addFeedback(state, "⚠️ 保持背部挺直", "warning");
-      }
-    }
-    if (smoothedAngle > 160) {
-      // Went back up without reaching bottom
-      state.phase = "standing";
-      addFeedback(state, "⚠️ 深蹲幅度不夠，請蹲更低", "warning");
     }
   } else if (state.phase === "at_bottom") {
-    if (smoothedAngle > 140) {
+    if (smoothedAngle > 130) {
       state.phase = "coming_up";
     }
   } else if (state.phase === "coming_up") {
-    if (smoothedAngle > 155) {
+    if (smoothedAngle > 145) {
       state.phase = "standing";
       quality = Math.max(quality, 60);
       countRep(state, quality);
@@ -224,33 +216,22 @@ export function detectPushup(
   let quality = 100;
 
   if (state.phase === "idle" || state.phase === "up") {
-    if (smoothedAngle > 150) {
+    if (smoothedAngle > 145) {
       state.phase = "up";
     }
-    if (smoothedAngle < 130) {
+    if (smoothedAngle < 135) {
       state.phase = "going_down";
     }
   } else if (state.phase === "going_down") {
-    if (smoothedAngle < 100) {
+    if (smoothedAngle < 115) {
       state.phase = "at_bottom";
-      if (smoothedAngle > 90) {
-        quality -= 15;
-        addFeedback(state, "⚠️ 手肘彎曲角度不足，再低一些", "warning");
-      }
-      if (bodyDrop > 0.1) {
-        quality -= 15;
-        addFeedback(state, "⚠️ 臀部太高或太低，保持身體水平", "warning");
-      }
-    }
-    if (smoothedAngle > 155) {
-      state.phase = "up";
     }
   } else if (state.phase === "at_bottom") {
-    if (smoothedAngle > 130) {
+    if (smoothedAngle > 125) {
       state.phase = "coming_up";
     }
   } else if (state.phase === "coming_up") {
-    if (smoothedAngle > 150) {
+    if (smoothedAngle > 140) {
       state.phase = "up";
       quality = Math.max(quality, 60);
       countRep(state, quality);
